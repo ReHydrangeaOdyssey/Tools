@@ -4,7 +4,7 @@
 Cocos Studio の armature_data と widgetTree/actionlist 両形式に対応。
 アセットは本ファイルの隣の ./assets 配下のみから読み込み、JSON参照もツール基準。
 シーンJSONは本ファイルの隣の ./out/scene/<シーン名>.json に固定保存。
-BGM / SE の試聴と、アニメーション開始時のSE連動・シーンJSON保存に対応。
+BGM / SE の試聴と、プレビュー音量の独立調整（JSONには非保存）・アニメーション開始時のSE連動に対応。
 PNG/JPGの範囲選択(正規化UV)・再編集・JSONへの保存/復元に対応。
 編集画面では端・中心へのスナップと等間隔スナップ（独立切替）、アセットの編集時のみ非表示に対応。
 PNG/JPGのUVボタンに加え、plistの2スプライトからトグルボタンを配置可能。JSONにも保存。
@@ -2130,6 +2130,8 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import wave
+import array
 
 
 APP_NAME = "シーン UI エディター"
@@ -2579,6 +2581,8 @@ def read_new_scene_assets(resources: Mapping[str, Any], critical: set[str],
                 pressed_source=pressed_source,
                 button_se=audio_link if group in ("button", "toggle button") else None,
                 toggle_default=default_state if group == "toggle button" else "off",
+                toggle_group=(validated_toggle_group_name(record["group"], label)
+                              if group == "toggle button" and "group" in record else None),
                 animation_se=audio_link if group == "animation" else None,
                 flip_x=read_asset_flip(record, "flip_x", label),
                 flip_y=read_asset_flip(record, "flip_y", label),
@@ -2622,6 +2626,7 @@ def read_new_scene_assets(resources: Mapping[str, Any], critical: set[str],
             if asset.missing:
                 warnings.append(f"{label}: {asset.missing}")
             assets.append(asset)
+    validate_toggle_groups(assets)
     return assets, warnings
 
 
@@ -2633,8 +2638,9 @@ def read_toggle_events(resources: Mapping[str, Any], main_assets: list[Asset],
     main_by_ref = {item.full_key: item for item in main_assets}
     ui = resources.get("ui", {})
     toggles = ui.get("toggle button", {})
-    if not isinstance(toggles, dict):
-        raise ValueError("ui['toggle button'] はオブジェクトにしてください。")
+    buttons = ui.get("button", {})
+    if not isinstance(toggles, dict) or not isinstance(buttons, dict):
+        raise ValueError("ui.button / ui['toggle button'] はオブジェクトにしてください。")
 
     def attach(owner: Asset, record: Mapping[str, Any], depth: int) -> None:
         if depth > 8:
@@ -2647,13 +2653,27 @@ def read_toggle_events(resources: Mapping[str, Any], main_assets: list[Asset],
                 raise ValueError(f"{owner.name}.events: イベントはオブジェクトが必要です。")
             etype = item.get("type")
             if etype == "hide":
+                if owner.kind != "toggle_uv":
+                    raise ValueError("通常ボタンにはアセット非表示イベントを設定できません。")
                 if set(item) != {"type", "target"}:
                     raise ValueError("非表示イベントは type と target のみ指定してください。")
                 target = main_by_ref.get(item["target"])
                 if target is None or target.uid == owner.uid:
                     raise ValueError(f"{owner.name}: 非表示対象 '{item['target']}' が見つかりません。")
                 owner.events.append({"type": "hide", "target_uid": target.uid})
+            elif etype in ("show_scroll_group", "hide_scroll_group", "toggle_scroll_group"):
+                if set(item) != {"type", "group"}:
+                    raise ValueError("スクロールグループイベントには type と group のみ指定してください。")
+                if owner.kind == "toggle_uv" and etype != "show_scroll_group":
+                    raise ValueError("トグルボタンで使用できるのはグループ表示イベントのみです。")
+                group_name = safe_asset_key(item["group"])
+                if any(e.get("group_name") == group_name for e in owner.events
+                       if e.get("type") in ("show_scroll_group", "hide_scroll_group", "toggle_scroll_group")):
+                    raise ValueError(f"{owner.name}: 同じスクロールグループの操作が重複しています。")
+                owner.events.append({"type": etype, "group_name": group_name})
             elif etype == "show":
+                if owner.kind != "toggle_uv":
+                    raise ValueError("通常ボタンにはアセット追加表示イベントを設定できません。")
                 if set(item) != {"type", "asset"}:
                     raise ValueError("追加表示イベントは type と asset のみ指定してください。")
                 spec = item["asset"]
@@ -2692,14 +2712,40 @@ def read_toggle_events(resources: Mapping[str, Any], main_assets: list[Asset],
                 result.append(child)
                 owner.events.append({"type": "show", "asset_uid": child.uid})
                 warnings.extend(child_warnings)
-                if child.kind == "toggle_uv":
+                if child.kind in ("toggle_uv", "button_uv"):
                     attach(child, data, depth + 1)
             else:
                 raise ValueError(f"{owner.name}: 未対応のイベント種別: {etype!r}")
     for owner in main_assets:
         if owner.kind == "toggle_uv":
             attach(owner, toggles[owner.name], 0)
+        elif owner.kind == "button_uv":
+            attach(owner, buttons[owner.name], 0)
     return result, warnings
+
+
+
+def validated_toggle_group_name(value: Any, label: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{label}.group は文字列にしてください。")
+    return safe_asset_key(value)
+
+
+def validate_toggle_groups(assets: Sequence["Asset"]) -> None:
+    """Validate exclusive groups without changing user-authored initial states."""
+    groups: dict[str, list[Asset]] = {}
+    for asset in assets:
+        if asset.toggle_group is None:
+            continue
+        if asset.kind != "toggle_uv" or asset.event_owner_uid is not None:
+            raise ValueError(f"{asset.name}: 排他グループには通常配置のトグルボタンのみ指定できます。")
+        safe_asset_key(asset.toggle_group)
+        groups.setdefault(asset.toggle_group, []).append(asset)
+    for name, members in groups.items():
+        if len(members) < 2:
+            raise ValueError(f"グループ {name}: スイッチが2個以上必要です。")
+        if sum(member.toggle_default == "on" for member in members) != 1:
+            raise ValueError(f"グループ {name}: 初期ONのスイッチを1個にしてください。")
 
 
 def inside_polygon(px: float, py: float, vertices: list[tuple[float, float]]) -> bool:
@@ -2721,6 +2767,88 @@ def transform_local(asset: "Asset", x: float, y: float) -> tuple[float, float]:
 
 
 @dataclass
+class ScrollGroup:
+    """Viewport and member IDs. Scroll displacement is preview-only and not persisted."""
+    name: str
+    px: float = 0.0
+    py: float = 0.0
+    width: float = 640.0
+    height: float = 360.0
+    scroll_x: bool = False
+    scroll_y: bool = True
+    members: set[str] = field(default_factory=set)
+
+    @property
+    def bounds(self) -> tuple[float, float, float, float]:
+        return (self.px - self.width / 2, self.py - self.height / 2,
+                self.px + self.width / 2, self.py + self.height / 2)
+
+
+def read_scroll_groups(raw: Any, assets: Sequence["Asset"], *, strict_numeric: bool = True
+                       ) -> dict[str, ScrollGroup]:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict) or len(raw) > 128:
+        raise ValueError("scroll_groups は128件以下のオブジェクトにしてください。")
+    # Both root assets and show-event children have globally unique
+    # group-qualified scene references.  Keep members as asset references so
+    # moving a root into a toggle event does not break the saved scroll group.
+    refs: dict[str, Asset] = {}
+    for asset in assets:
+        ref = asset.full_key
+        if ref in refs:
+            raise ValueError(f"scroll_groups: アセット参照が重複しています: {ref}")
+        refs[ref] = asset
+    result: dict[str, ScrollGroup] = {}
+    used: set[str] = set()
+    for name, record in raw.items():
+        safe_asset_key(name)
+        if not isinstance(record, dict):
+            raise ValueError(f"scroll_groups.{name} はオブジェクトにしてください。")
+        if set(record) != {"px", "py", "width", "height", "scroll_x", "scroll_y", "members"}:
+            raise ValueError(f"scroll_groups.{name}: px/py/width/height/scroll_x/scroll_y/members が必要です。")
+        dims = {key: scene_number(record[key], f"scroll_groups.{name}.{key}", strict_numeric=strict_numeric)
+                for key in ("px", "py", "width", "height")}
+        if not 1 <= dims["width"] <= DESIGN_W * 4 or not 1 <= dims["height"] <= DESIGN_H * 4:
+            raise ValueError(f"scroll_groups.{name}: 範囲の幅・高さが不正です。")
+        for axis in ("scroll_x", "scroll_y"):
+            if type(record[axis]) is not bool:
+                raise ValueError(f"scroll_groups.{name}.{axis} はboolが必要です。")
+        if not isinstance(record["members"], list) or any(not isinstance(v, str) for v in record["members"]):
+            raise ValueError(f"scroll_groups.{name}.members はアセット参照の配列にしてください。")
+        if len(set(record["members"])) != len(record["members"]):
+            raise ValueError(f"scroll_groups.{name}: 同一アセットが重複しています。")
+        members = set()
+        for ref in record["members"]:
+            if ref not in refs:
+                raise ValueError(f"scroll_groups.{name}: アセットが見つかりません: {ref}")
+            if ref in used:
+                raise ValueError(f"scroll_groups: アセット {ref} は複数のグループに所属できません。")
+            members.add(refs[ref].uid)
+            used.add(ref)
+        result[name] = ScrollGroup(name=name, **dims, scroll_x=record["scroll_x"],
+                                   scroll_y=record["scroll_y"], members=members)
+    return result
+
+
+def validate_scroll_toggle_events(assets: Sequence["Asset"],
+                                  scroll_groups: Mapping[str, ScrollGroup]) -> None:
+    """Verify referenced viewport exists and its own trigger is not one of its members."""
+    for owner in assets:
+        if owner.kind not in ("toggle_uv", "button_uv", "button"):
+            continue
+        for event in owner.events:
+            if event.get("type") not in ("show_scroll_group", "hide_scroll_group", "toggle_scroll_group"):
+                continue
+            name = event.get("group_name")
+            group = scroll_groups.get(name) if isinstance(name, str) else None
+            if group is None:
+                raise ValueError(f"{owner.name}: スクロールグループ '{name}' が見つかりません。")
+            if owner.uid in group.members and event["type"] != "hide_scroll_group":
+                raise ValueError(f"{owner.name}: 自身の所属グループは表示・切替イベントで制御できません。")
+
+
+@dataclass
 class Asset:
     name: str
     kind: str                   # image / button_uv / toggle_uv / button / animation / window
@@ -2737,9 +2865,10 @@ class Asset:
     pressed_source: Optional[Path] = None  # Optional separate PNG/JPG for pressed state.
     button_se: Optional[str] = None  # Refers to assets.se.<key> for buttons.
     toggle_default: str = "off"   # Toggle only: initial state, either off or on.
+    toggle_group: Optional[str] = None  # Exclusive group ID.  Only one member may be ON.
     event_owner_uid: Optional[str] = None  # A show-event asset is embedded in its toggle.
     event_layer: Optional[int] = None  # Absolute stack index for JSON round-trips.
-    events: list[dict[str, str]] = field(default_factory=list)  # show(asset_uid) / hide(target_uid)
+    events: list[dict[str, str]] = field(default_factory=list)  # Toggle: show/hide; buttons: show/hide/toggle_scroll_group.
     pressed_image: Optional[Image.Image] = field(default=None, repr=False)
     px: float = 0.0
     py: float = 0.0
@@ -4677,6 +4806,8 @@ class _AudioVoice:
     process: Any = None
     looping: bool = False
     started: float = field(default_factory=time.monotonic)
+    original: Optional[Path] = None
+    key: str = ""
 
 
 class AudioPlayer:
@@ -4704,6 +4835,13 @@ class AudioPlayer:
         self._ffmpeg_checked = False
         self._ffplay = shutil.which("ffplay")
         self._winmm = ctypes.windll.winmm if self.is_windows else None
+        # Preview-only levels, deliberately omitted from every scene JSON.
+        # The two channels are independent (100 = unattenuated source).
+        self.volumes: dict[str, int] = {"bgm": 25, "se": 35}
+        self._gain_cache: dict[tuple[Any, ...], Path] = {}
+        self._pending_play: dict[str, tuple[int, str, Path, int]] = {}
+        self._current_bgm: Optional[tuple[str, Path]] = None
+        self._volume_restart_job: Optional[str] = None
 
     @staticmethod
     def _vgmstream_path() -> Optional[Path]:
@@ -4811,7 +4949,121 @@ class AudioPlayer:
             output.unlink(missing_ok=True)
             raise
 
-    def play(self, kind: str, key: str, source: Path) -> None:
+    def _gain_wav(self, source: Path, volume: int) -> Path:
+        """Create a per-channel PCM WAV preview; never change the source file.
+
+        Windows' waveaudio MCI driver does NOT implement `setaudio ... volume`.
+        Software attenuation of a temporary PCM WAV is therefore required for
+        WAV, decoded HCA and decoded OGG. PCM 8/16/24/32 bit is supported using
+        only the standard library (including Python 3.13 without audioop).
+        """
+        volume = max(0, min(100, int(volume)))
+        if volume == 100:
+            return source
+        stat = source.stat()
+        token = (str(source.resolve()), stat.st_mtime_ns, stat.st_size, volume)
+        cached = self._gain_cache.get(token)
+        if cached is not None and cached.is_file():
+            return cached
+        target = Path(self.tmpdir.name) / ("gain_" + uuid.uuid4().hex + ".wav")
+        try:
+            with wave.open(str(source), 'rb') as reader:
+                params = reader.getparams()
+                width = params.sampwidth
+                if width not in (1, 2, 3, 4):
+                    raise ValueError(f"音量調整に未対応のWAV量子化幅です: {width}")
+                with wave.open(str(target), 'wb') as writer:
+                    writer.setparams(params)
+                    while True:
+                        chunk = reader.readframes(8192)
+                        if not chunk:
+                            break
+                        if width == 1:
+                            # 8-bit WAV PCM is unsigned, with silence at 128.
+                            converted = bytes(max(0,min(255,round((b-128)*volume/100+128)))
+                                              for b in chunk)
+                        elif width in (2, 4):
+                            import sys as _sys
+                            data = array.array('h' if width == 2 else 'i')
+                            data.frombytes(chunk)
+                            if _sys.byteorder != 'little':
+                                data.byteswap()
+                            upper = (1 << (width*8-1))-1
+                            lower = -upper-1
+                            converted_data = array.array(data.typecode,
+                                (max(lower,min(upper,round(value*volume/100))) for value in data))
+                            if _sys.byteorder != 'little':
+                                converted_data.byteswap()
+                            converted = converted_data.tobytes()
+                        else:
+                            # Signed little-endian 24-bit PCM.
+                            bound = 1 << 23
+                            out = bytearray()
+                            for i in range(0,len(chunk),3):
+                                sample = int.from_bytes(chunk[i:i+3], 'little', signed=True)
+                                value = max(-bound,min(bound-1,round(sample*volume/100)))
+                                out.extend(value.to_bytes(3,'little',signed=True))
+                            converted = out
+                        writer.writeframesraw(converted)
+            self._gain_cache[token] = target
+            return target
+        except BaseException:
+            target.unlink(missing_ok=True)
+            raise
+
+    def set_volume(self, kind: str, volume: int) -> None:
+        """Change preview gain without modifying the scene or source audio."""
+        if kind not in self.volumes:
+            raise ValueError("音声種別が不正です。")
+        volume = max(0, min(100, int(float(volume))))
+        if self.volumes[kind] == volume:
+            return
+        self.volumes[kind] = volume
+        if self.is_windows:
+            changed_natively = False
+            need_reopen = False
+            for handle, voice in list(self.voices.items()):
+                if voice.kind != kind or voice.original is None:
+                    continue
+                # MPEGVideo MCI permits live volume updates, unlike waveaudio.
+                if voice.original.suffix.casefold() == '.mp3':
+                    try:
+                        self._mci(f"setaudio {handle} volume to {volume * 10}")
+                        changed_natively = True
+                        continue
+                    except OSError:
+                        pass
+                need_reopen = True
+            if kind == 'bgm' and changed_natively and not need_reopen:
+                return  # MP3 BGM changed in place: don't interrupt playback.
+        # For WAV and ffplay, recreate the BGM voice at its playback position.
+        # Debounce while the slider is being dragged; short SEs use the new
+        # gain the next time they are triggered.
+        if kind == 'bgm' and self._current_bgm is not None and (
+                any(v.kind == 'bgm' for v in self.voices.values()) or self._workers):
+            if self._volume_restart_job is not None:
+                self.parent.after_cancel(self._volume_restart_job)
+            self._volume_restart_job = self.parent.after(300, self._restart_bgm_volume)
+
+    def _restart_bgm_volume(self) -> None:
+        self._volume_restart_job = None
+        if self._closed or self._current_bgm is None:
+            return
+        name, source = self._current_bgm
+        resume_ms = 0
+        for handle, voice in self.voices.items():
+            if voice.kind != 'bgm':
+                continue
+            resume_ms = max(0,int((time.monotonic()-voice.started)*1000))
+            if self.is_windows:
+                try:
+                    resume_ms = max(0,int(self._mci(f"status {handle} position")))
+                except (OSError, ValueError):
+                    pass
+            break
+        self.play('bgm', name, source, resume_ms=resume_ms)
+
+    def play(self, kind: str, key: str, source: Path, *, resume_ms: int = 0) -> None:
         if kind not in ("se", "bgm"):
             raise ValueError("音声種別が不正です。")
         source = source.expanduser().resolve()
@@ -4823,15 +5075,18 @@ class AudioPlayer:
             return
         self.generation[kind] += 1
         gen = self.generation[kind]
+        self._pending_play[kind] = (gen, key, source, max(0,int(resume_ms)))
         if kind == "bgm":
+            self._current_bgm = (key, source)
             self._stop_voices("bgm")
         suffix = source.suffix.casefold()
         needs_vgmstream = suffix == ".hca"
         needs_ffmpeg = self.is_windows and suffix == ".ogg"
+        needs_wav_gain = self.is_windows and suffix == '.wav' and self.volumes[kind] != 100
         if not self.is_windows and not self._ffplay:
             messagebox.showerror(APP_NAME, "音声プレビューにはffplay (FFmpeg) が必要です。", parent=self.parent)
             return
-        if needs_vgmstream or needs_ffmpeg:
+        if needs_vgmstream or needs_ffmpeg or needs_wav_gain:
             if needs_vgmstream:
                 decoder = self._vgmstream_path()
                 if decoder is None:
@@ -4847,42 +5102,52 @@ class AudioPlayer:
                     return
                 executable = str(decoder)
                 label = "vgmstream"
-            else:
+            elif needs_ffmpeg:
                 executable = self._ffmpeg_path(request_install=True)
                 if not executable:
-                    # FFmpeg setup prompts only apply to OGG, not HCA.
                     return
                 label = "FFmpeg"
-            self.status.set(f"音声変換中 ({label}): {kind}.{key}")
+            else:
+                executable = None
+                label = 'WAV音量調整'
+            self.status.set(f"音声処理中 ({label}): {kind}.{key}")
             self._workers += 1
+            level = self.volumes[kind]
             def worker() -> None:
                 converted: Optional[Path] = None
                 error: Optional[str] = None
                 try:
-                    converted = self._decode(source, executable, use_vgmstream=needs_vgmstream)
-                except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+                    decoded = (self._decode(source, executable, use_vgmstream=needs_vgmstream)
+                               if executable is not None else source)
+                    converted = self._gain_wav(decoded, level) if self.is_windows else decoded
+                except (OSError, ValueError, EOFError, wave.Error, subprocess.TimeoutExpired) as exc:
                     error = str(exc)
                 finally:
                     self.queue.put((kind, gen, converted, kind == "bgm", error))
-            threading.Thread(target=worker, daemon=True, name="SceneAudioDecode").start()
+            threading.Thread(target=worker, daemon=True, name="SceneAudioGainDecode").start()
             self._ensure_poll()
             return
         try:
-            self._start_voice(kind, source, loop=kind == "bgm")
+            self._start_voice(kind, source, loop=kind == "bgm", key=key,
+                              original=source, resume_ms=resume_ms)
             self.status.set(f"音声再生: {kind}.{key}")
         except (OSError, ValueError) as exc:
             messagebox.showerror(APP_NAME, f"音声を再生できません:\n{exc}", parent=self.parent)
         self._ensure_poll()
 
-    def _start_voice(self, kind: str, source: Path, *, loop: bool) -> None:
+    def _start_voice(self, kind: str, source: Path, *, loop: bool, key: str = '',
+                     original: Optional[Path] = None, resume_ms: int = 0) -> None:
         if kind == "se":
             voices = sorted(((key, voice) for key, voice in self.voices.items()
                              if voice.kind == "se"), key=lambda pair: pair[1].started)
             if len(voices) >= AUDIO_SE_VOICE_LIMIT:
                 self._close_voice(voices[0][0])
         handle = "sce_" + uuid.uuid4().hex[:16]
+        original = original or source
         if self.is_windows:
             filename = str(source)
+            # Decode and gain WAV in a separate file; do not use waveOutSetVolume,
+            # which would change the entire device rather than only BGM or SE.
             try:
                 self._mci(f'open "{filename}" alias {handle}')
             except OSError:
@@ -4890,30 +5155,39 @@ class AudioPlayer:
                     raise
                 self._mci(f'open "{filename}" type mpegvideo alias {handle}')
             try:
-                self._mci(f"play {handle}" + (" repeat" if loop else ""))
-            except OSError:
-                # Some Windows MCI codecs do not support 'repeat'. Polling below
-                # restarts a BGM at its end instead.
-                if not loop:
-                    self._mci(f"close {handle}")
-                    raise
+                if source.suffix.casefold() == '.mp3':
+                    # MPEGVideo supports 0..1000 per-voice volume.
+                    self._mci(f"setaudio {handle} volume to {self.volumes[kind]*10}")
+                if resume_ms > 0:
+                    try:
+                        self._mci(f"seek {handle} to {resume_ms}")
+                    except OSError:
+                        pass
                 try:
-                    self._mci(f"play {handle}")
+                    self._mci(f"play {handle}" + (" repeat" if loop else ""))
                 except OSError:
-                    self._mci(f"close {handle}")
-                    raise
-            voice = _AudioVoice(kind, handle, looping=loop)
+                    if not loop:
+                        raise
+                    self._mci(f"play {handle}")
+            except OSError:
+                self._mci(f"close {handle}")
+                raise
+            voice = _AudioVoice(kind, handle, looping=loop, original=original,key=key)
         else:
             assert self._ffplay is not None
-            command = [self._ffplay, "-nostdin", "-nodisp", "-autoexit", "-loglevel", "error"]
+            command = [self._ffplay, "-nostdin", "-nodisp", "-autoexit", "-loglevel", "error",
+                       "-volume", str(self.volumes[kind])]
             if loop:
                 command += ["-loop", "0"]
+            if resume_ms > 0:
+                command += ["-ss", f"{resume_ms/1000:.3f}"]
             command.append(str(source))
             flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             process = subprocess.Popen(command, stdin=subprocess.DEVNULL,
                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                        creationflags=flags)
-            voice = _AudioVoice(kind, handle, process=process, looping=loop)
+            voice = _AudioVoice(kind, handle, process=process, looping=loop,
+                                original=original,key=key)
         self.voices[handle] = voice
 
     def _close_voice(self, handle: str) -> None:
@@ -4947,6 +5221,11 @@ class AudioPlayer:
         for current in ([kind] if kind else ["bgm", "se"]):
             self.generation[current] += 1  # Cancel pending decoded play jobs.
         self._stop_voices(kind)
+        if kind is None or kind == 'bgm':
+            self._current_bgm = None
+            if self._volume_restart_job is not None:
+                self.parent.after_cancel(self._volume_restart_job)
+                self._volume_restart_job = None
         if not self._closed:
             self.status.set((kind.upper() if kind else "全音声") + " を停止しました")
 
@@ -4970,7 +5249,12 @@ class AudioPlayer:
                 messagebox.showerror(APP_NAME, "音声を変換できません:\n" + error, parent=self.parent)
             elif path is not None:
                 try:
-                    self._start_voice(kind, path, loop=looping)
+                    pending = self._pending_play.get(kind)
+                    if pending is None or pending[0] != gen:
+                        continue
+                    _, key, original, resume_ms = pending
+                    self._start_voice(kind, path, loop=looping, key=key,
+                                      original=original, resume_ms=resume_ms)
                     self.status.set(f"再生中: {kind}")
                 except (OSError, ValueError) as exc:
                     messagebox.showerror(APP_NAME, f"音声を再生できません:\n{exc}", parent=self.parent)
@@ -4992,6 +5276,9 @@ class AudioPlayer:
 
     def shutdown(self) -> None:
         self._closed = True
+        if self._volume_restart_job is not None:
+            self.parent.after_cancel(self._volume_restart_job)
+            self._volume_restart_job = None
         if self._poll_job is not None:
             self.parent.after_cancel(self._poll_job)
             self._poll_job = None
@@ -5106,6 +5393,11 @@ class ToggleEventWindow(tk.Toplevel):
                 asset = self.editor._asset_by_uid(entry["asset_uid"])
                 detail = f"{asset.name}（{asset.kind}）" if asset else "（削除済み）"
                 title = "アセットの追加表示"
+            elif entry["type"] == "show_scroll_group":
+                name = entry["group_name"]
+                group = self.editor.scroll_groups.get(name)
+                detail = f"{name}（所属 {len(group.members)} 件）" if group else f"{name}（削除済み）"
+                title = "スクロールグループの表示"
             else:
                 asset = self.editor._asset_by_uid(entry["target_uid"])
                 detail = f"{asset.name}（{asset.full_key}）" if asset else "（削除済み）"
@@ -5139,6 +5431,7 @@ class ToggleEventWindow(tk.Toplevel):
             show_menu.add_command(label=label,
                                   command=lambda k=kind: self._add_show(k))
         menu.add_cascade(label="アセットの追加表示", menu=show_menu)
+        menu.add_command(label="スクロールグループの表示", command=self._add_scroll_group)
         menu.add_command(label="アセットの非表示", command=self._add_hide)
         x = self.add_button.winfo_rootx()
         y = self.add_button.winfo_rooty() + self.add_button.winfo_height()
@@ -5155,6 +5448,57 @@ class ToggleEventWindow(tk.Toplevel):
         if asset is not None:
             self.refresh_list()
             self.editor.status_text.set(f"ON時の追加表示: {asset.name}。編集画面で配置を調整できます。")
+
+    def _add_scroll_group(self) -> None:
+        """Add references to existing scroll viewports without moving/duplicating members."""
+        owner = self.editor._asset_by_uid(self.owner_uid)
+        if owner is None:
+            return
+        registered = {event["group_name"] for event in owner.events
+                      if event["type"] == "show_scroll_group"}
+        candidates = [g for g in self.editor.scroll_groups.values()
+                      if g.name not in registered and owner.uid not in g.members]
+        if not candidates:
+            messagebox.showinfo(APP_NAME,
+                "追加可能なスクロールグループがありません。\n先にスクロールグループを作成してください。",
+                parent=self)
+            return
+        popup = tk.Toplevel(self)
+        popup.title("ON時に表示するスクロールグループ")
+        popup.transient(self)
+        outer = ttk.Frame(popup, padding=12)
+        outer.pack(fill="both", expand=True)
+        ttk.Label(outer, text="トグルONの間だけ表示するグループを選択してください。\n"
+                  "所属アセットは移動・複製されません。Ctrl / Shiftで複数選択できます。",
+                  wraplength=460).pack(anchor="w")
+        listing = tk.Listbox(outer, selectmode=tk.EXTENDED, exportselection=False,
+                             height=min(12, max(5, len(candidates))), width=60)
+        listing.pack(fill="both", expand=True, pady=(9, 6))
+        for group in candidates:
+            listing.insert(tk.END, f"{group.name}   / 所属 {len(group.members)} 件"
+                           f"  X:{'ON' if group.scroll_x else 'OFF'}"
+                           f"  Y:{'ON' if group.scroll_y else 'OFF'}")
+        def confirm(_event: Any = None) -> None:
+            indices = listing.curselection()
+            if not indices:
+                messagebox.showinfo(APP_NAME, "グループを選択してください。", parent=popup)
+                return
+            try:
+                self.editor.add_scroll_group_show_events(
+                    self.owner_uid, [candidates[i].name for i in indices])
+            except ValueError as exc:
+                messagebox.showerror(APP_NAME, str(exc), parent=popup)
+                return
+            popup.destroy()
+            self.refresh_list()
+        buttons = ttk.Frame(outer)
+        buttons.pack(fill="x", pady=(5, 0))
+        ttk.Button(buttons, text="追加", command=confirm).pack(side="right", padx=(7, 0))
+        ttk.Button(buttons, text="キャンセル", command=popup.destroy).pack(side="right")
+        listing.bind("<Double-1>", confirm)
+        self.editor._place_child_window(popup, self, (550, 350))
+        popup.grab_set()
+        listing.focus_set()
 
     def _add_existing_show(self) -> None:
         """Transfer selected root assets into this toggle's show events."""
@@ -5394,11 +5738,1488 @@ class ToggleEventWindow(tk.Toplevel):
         if owner is None or index is None or index >= len(owner.events):
             return
         event = owner.events[index]
+        if event["type"] == "show_scroll_group":
+            name = event["group_name"]
+            if name in self.editor.scroll_groups:
+                self.editor.open_scroll_workspace(name)
+            return
         uid = event.get("asset_uid") if event["type"] == "show" else event.get("target_uid")
         if self.editor._asset_by_uid(uid) is not None:
             self.editor.select(uid)
             self.editor.lift()
             self.editor.edit_canvas.focus_set()
+
+
+class ButtonScrollEventWindow(tk.Toplevel):
+    """Configure persistent scroll-group commands on a regular button press.
+
+    Unlike toggle ON-gating, a normal button applies a command once per click.
+    The last click wins until the preview state is reset.
+    """
+    ACTIONS = (("show_scroll_group", "スクロールグループを表示"),
+               ("hide_scroll_group", "スクロールグループを非表示"),
+               ("toggle_scroll_group", "表示／非表示を切替"))
+
+    def __init__(self, editor: "SceneEditor", owner_uid: str) -> None:
+        super().__init__(editor)
+        self.editor = editor
+        self.owner_uid = owner_uid
+        self.title("通常ボタン - 押下時のスクロールイベント")
+        self.transient(editor)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.minsize(480, 310)
+        frame = ttk.Frame(self, padding=12)
+        frame.pack(fill="both", expand=True)
+        owner = editor._asset_by_uid(owner_uid)
+        ttk.Label(frame, text=f"{owner.name if owner else ''}：押下時のイベント",
+                  font=("", 11, "bold")).pack(anchor="w")
+        ttk.Label(frame, text="表示・非表示はプレビューで押した時に反映されます。"
+                  " 別のボタンによる操作やプレビューの再読み込みまで保持します。",
+                  wraplength=540).pack(anchor="w", pady=(5, 9))
+        table = ttk.Frame(frame)
+        table.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(table, columns=("action", "target"),
+                                 show="headings", selectmode="browse", height=9)
+        self.tree.heading("action", text="実行内容")
+        self.tree.heading("target", text="対象グループ")
+        self.tree.column("action", width=195, minwidth=160, stretch=False)
+        self.tree.column("target", width=250, stretch=True)
+        self.tree.pack(side="left", fill="both", expand=True)
+        scrollbar = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        controls = ttk.Frame(frame)
+        controls.pack(fill="x", pady=(9, 0))
+        ttk.Button(controls, text="イベントを追加…", command=self._add).pack(side="left")
+        ttk.Button(controls, text="選択イベントを削除", command=self._remove).pack(side="left", padx=6)
+        ttk.Button(controls, text="グループ配置画面", command=self._open_group).pack(side="left")
+        ttk.Button(controls, text="閉じる", command=self._close).pack(side="right")
+        self.tree.bind("<Double-1>", lambda _e: self._open_group())
+        editor._place_child_window(self, editor, (625, 390))
+        self.refresh_list()
+
+    def _close(self) -> None:
+        self.editor._event_windows.pop(self.owner_uid, None)
+        self.destroy()
+
+    def refresh_list(self) -> None:
+        old = self.tree.selection()
+        self.tree.delete(*self.tree.get_children())
+        owner = self.editor._asset_by_uid(self.owner_uid)
+        if owner is None or owner.kind not in ("button", "button_uv"):
+            self._close()
+            return
+        labels = dict(self.ACTIONS)
+        for i, event in enumerate(owner.events):
+            kind = event.get("type")
+            if kind in labels:
+                name = event["group_name"]
+                missing = "（削除済み）" if name not in self.editor.scroll_groups else ""
+                self.tree.insert("", "end", iid=str(i), values=(labels[kind], name+missing))
+        if old and self.tree.exists(old[0]):
+            self.tree.selection_set(old[0])
+
+    def _add(self) -> None:
+        owner = self.editor._asset_by_uid(self.owner_uid)
+        if owner is None:
+            return
+        candidates = [group for group in self.editor.scroll_groups.values()
+                      if not any(e.get("group_name") == group.name for e in owner.events)]
+        if not candidates:
+            messagebox.showinfo(APP_NAME, "追加できるスクロールグループがありません。", parent=self)
+            return
+        popup = tk.Toplevel(self)
+        popup.title("スクロールグループの操作を追加")
+        popup.transient(self)
+        frame = ttk.Frame(popup, padding=12)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="押下時の操作を選択してください。", wraplength=480).pack(anchor="w")
+        action_var = tk.StringVar(value="show_scroll_group")
+        for value, label in self.ACTIONS:
+            ttk.Radiobutton(frame, text=label, variable=action_var,
+                            value=value).pack(anchor="w", pady=2)
+        ttk.Label(frame, text="対象グループ（Ctrl / Shiftで複数選択）").pack(anchor="w", pady=(8, 3))
+        listing = tk.Listbox(frame, selectmode=tk.EXTENDED, exportselection=False, height=9)
+        listing.pack(fill="both", expand=True)
+        for group in candidates:
+            listing.insert(tk.END, f"{group.name}  / 所属 {len(group.members)} 件")
+        def confirm(_event: Any = None) -> None:
+            chosen = [candidates[i].name for i in listing.curselection()]
+            if not chosen:
+                messagebox.showinfo(APP_NAME, "グループを選択してください。", parent=popup)
+                return
+            try:
+                self.editor.add_button_scroll_events(self.owner_uid, action_var.get(), chosen)
+            except ValueError as exc:
+                messagebox.showerror(APP_NAME, str(exc), parent=popup)
+                return
+            popup.destroy()
+            self.refresh_list()
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x", pady=(8, 0))
+        ttk.Button(buttons, text="追加", command=confirm).pack(side="right", padx=(6, 0))
+        ttk.Button(buttons, text="キャンセル", command=popup.destroy).pack(side="right")
+        popup.bind("<Return>", confirm)
+        self.editor._place_child_window(popup, self, (530, 450))
+        popup.grab_set()
+        listing.focus_set()
+
+    def _remove(self) -> None:
+        owner = self.editor._asset_by_uid(self.owner_uid)
+        rows = self.tree.selection()
+        if owner is None or not rows:
+            return
+        self.editor.remove_button_scroll_event(self.owner_uid, int(rows[0]))
+        self.refresh_list()
+
+    def _open_group(self) -> None:
+        owner = self.editor._asset_by_uid(self.owner_uid)
+        rows = self.tree.selection()
+        if owner is None or not rows:
+            return
+        name = owner.events[int(rows[0])].get("group_name")
+        if name in self.editor.scroll_groups:
+            self.editor.open_scroll_workspace(name)
+
+
+class ExclusiveToggleGroupDialog(tk.Toplevel):
+    """Edit a mutually-exclusive family of independently editable toggle assets.
+
+    Children have their own textures, normalized UVs, events, and transforms. Only
+    the group identity and initial selection are shared. No scene records are
+    mutated until the final confirmation button is pressed.
+    """
+    MAX_MEMBERS = 64
+
+    def __init__(self, editor: "SceneEditor", group: Optional[str] = None) -> None:
+        super().__init__(editor)
+        self.editor = editor
+        self.group = group
+        self.result: Optional[tuple[str, list[Asset], set[str], int, dict[str, str]]] = None
+        self.members = [editor._asset_state_copy(a) for a in editor.assets
+                        if a.toggle_group == group and group is not None]
+        self.original_uids = {a.uid for a in self.members}
+        # Remember the source of each newly duplicated switch. Event children are
+        # given new UIDs only on confirmation, keeping Cancel non-destructive.
+        self.duplicate_sources: dict[str, str] = {}
+        self.name_var = tk.StringVar(value=group or "toggle_group")
+        self.initial_var = tk.StringVar(value=next((a.uid for a in self.members
+                                        if a.toggle_default == "on"),
+                                        self.members[0].uid if self.members else ""))
+        self.title("複数トグルスイッチ - グループ設定")
+        self.transient(editor)
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.minsize(570, 390)
+        outer = ttk.Frame(self, padding=12)
+        outer.pack(fill="both", expand=True)
+        ttk.Label(outer, text="複数トグルスイッチ（ONは常に1個）",
+                  font=("", 11, "bold")).pack(anchor="w")
+        ttk.Label(outer, text="各行は個別のトグルボタンです。画像・UV・SEを個別設定できます。\n"
+                  "確定後は編集画面で各スイッチの位置やサイズを調整できます。",
+                  justify="left").pack(anchor="w", pady=(5, 10))
+        row = ttk.Frame(outer)
+        row.pack(fill="x", pady=(0, 8))
+        ttk.Label(row, text="グループ名:").pack(side="left")
+        ttk.Entry(row, textvariable=self.name_var, width=28).pack(side="left", padx=8)
+        table_frame = ttk.Frame(outer)
+        table_frame.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(table_frame, columns=("default", "off", "on", "se"),
+                                 show="tree headings", selectmode="browse", height=9)
+        self.tree.heading("#0", text="スイッチ名")
+        self.tree.heading("default", text="初期状態")
+        self.tree.heading("off", text="OFF画像")
+        self.tree.heading("on", text="ON画像")
+        self.tree.heading("se", text="SE")
+        self.tree.column("#0", width=140, minwidth=95)
+        self.tree.column("default", width=75, minwidth=72, anchor="center", stretch=False)
+        self.tree.column("off", width=120)
+        self.tree.column("on", width=120)
+        self.tree.column("se", width=95)
+        self.tree.pack(side="left", fill="both", expand=True)
+        self.table_scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
+        self.table_scrollbar.pack(side="right", fill="y")
+        self.tree.configure(yscrollcommand=self.table_scrollbar.set)
+        self.tree.bind("<Double-1>", lambda _event: self.edit_member())
+        controls = ttk.Frame(outer)
+        controls.pack(fill="x", pady=(10, 0))
+        first_controls = ttk.Frame(controls)
+        first_controls.pack(fill="x", pady=(0, 5))
+        ttk.Button(first_controls, text="スイッチを追加…", command=self.add_member).pack(side="left", padx=(0, 5))
+        ttk.Button(first_controls, text="既存のトグルボタン追加", command=self.add_existing_member).pack(side="left", padx=5)
+        ttk.Button(first_controls, text="選択スイッチを複製 (Ctrl+D)", command=self.duplicate_member).pack(side="left", padx=5)
+        second_controls = ttk.Frame(controls)
+        second_controls.pack(fill="x")
+        ttk.Button(second_controls, text="名前を変更…", command=self.rename_member).pack(side="left", padx=(0, 5))
+        ttk.Button(second_controls, text="画像・UV・SEを編集", command=self.edit_member).pack(side="left", padx=5)
+        ttk.Button(second_controls, text="初期ONに指定", command=self.choose_default).pack(side="left", padx=5)
+        ttk.Button(second_controls, text="グループから外す", command=self.remove_member).pack(side="left", padx=5)
+        self.bind("<Control-d>", self._duplicate_shortcut)
+        self.bind("<Control-D>", self._duplicate_shortcut)
+        footer = ttk.Frame(outer)
+        footer.pack(fill="x", pady=(12, 0))
+        ttk.Label(footer, text="2個以上必要です。外した既存アセットは単独トグルになります。",
+                  wraplength=380).pack(side="left", fill="x", expand=True)
+        ttk.Button(footer, text="キャンセル", command=self.destroy).pack(side="right", padx=(6, 0))
+        ttk.Button(footer, text="確定して配置", command=self.confirm).pack(side="right")
+        requested_w = min(950, max(570, self.winfo_screenwidth() - 70))
+        requested_h = min(530, max(390, self.winfo_screenheight() - 100))
+        editor._place_child_window(self, editor, (requested_w, requested_h))
+        self.refresh_list()
+        self.grab_set()
+        self.wait_window()
+
+    def refresh_list(self) -> None:
+        old = self.tree.selection()
+        self.tree.delete(*self.tree.get_children())
+        for member in self.members:
+            self.tree.insert("", "end", iid=member.uid, text=member.name,
+                values=("ON" if member.uid == self.initial_var.get() else "OFF",
+                        member.source.name,
+                        (member.pressed_source or member.source).name,
+                        member.button_se or "なし"))
+        if old and self.tree.exists(old[0]):
+            self.tree.selection_set(old[0])
+
+    def _current(self) -> Optional[Asset]:
+        sel = self.tree.selection()
+        return next((a for a in self.members if sel and a.uid == sel[0]), None)
+
+    def _unique_member_name(self, original: str) -> str:
+        existing = {a.name for a in self.editor.assets} | {a.name for a in self.members}
+        root = re.sub(r"[^\w.\-]", "_", original, flags=re.UNICODE) or "switch"
+        if root not in existing:
+            return root
+        counter = 2
+        while f"{root}_{counter}" in existing:
+            counter += 1
+        return f"{root}_{counter}"
+
+    def _duplicate_shortcut(self, _event: tk.Event) -> str:
+        self.duplicate_member()
+        return "break"
+
+    def duplicate_member(self) -> None:
+        """Copy a switch's art, UV, SE, flags and event definitions into a new row."""
+        current = self._current()
+        if current is None:
+            messagebox.showinfo(APP_NAME, "複製するスイッチを一覧から選んでください。", parent=self)
+            return
+        if len(self.members) >= self.MAX_MEMBERS:
+            messagebox.showwarning(APP_NAME, "スイッチは最大64個までです。", parent=self)
+            return
+        clone = self.editor._asset_state_copy(current)
+        clone.uid = uuid.uuid4().hex
+        base_name = current.name
+        numbered = re.fullmatch(r"(.+)_([2-9][0-9]*)", base_name)
+        if numbered and any(a.name == numbered.group(1) for a in self.members):
+            base_name = numbered.group(1)
+        clone.name = self._unique_member_name(base_name)
+        clone.toggle_group = None
+        clone.toggle_default = "off"
+        clone.event_owner_uid = None
+        clone.px += 32.0
+        clone.py -= 32.0
+        self.duplicate_sources[clone.uid] = current.uid
+        # Insert next to the source so successive duplicates stay easy to find.
+        self.members.insert(self.members.index(current) + 1, clone)
+        self.refresh_list()
+        self.tree.selection_set(clone.uid)
+        self.tree.focus(clone.uid)
+        self.tree.see(clone.uid)
+
+    def rename_member(self) -> None:
+        member = self._current()
+        if member is None:
+            messagebox.showinfo(APP_NAME, "名前を変更するスイッチを選んでください。", parent=self)
+            return
+        requested = simpledialog.askstring(APP_NAME, "スイッチ名:",
+                                            initialvalue=member.name, parent=self)
+        if requested is None:
+            return
+        try:
+            name = safe_asset_key(requested)
+            if any(a.uid != member.uid and a.name == name and a.category == member.category
+                   for a in self.editor.assets if a.uid not in self.original_uids):
+                raise ValueError("この名前は他のアセットで使用されています。")
+            if any(a.uid != member.uid and a.name == name for a in self.members):
+                raise ValueError("この名前は別のスイッチで使用されています。")
+            member.name = name
+            self.refresh_list()
+            self.tree.selection_set(member.uid)
+        except ValueError as exc:
+            messagebox.showerror(APP_NAME, str(exc), parent=self)
+
+    def choose_default(self) -> None:
+        member = self._current()
+        if member is not None:
+            self.initial_var.set(member.uid)
+            self.refresh_list()
+
+    def _select_uv(self, asset: Asset) -> bool:
+        dialog = ButtonUVDialog(self, asset.source,
+            normal=asset.uv_rect, pressed=asset.pressed_uv_rect,
+            se=asset.button_se, se_keys=self.editor.audio["se"],
+            pressed_path=asset.pressed_source or asset.source,
+            toggle_mode=True, default_state="off")
+        if dialog.result is None:
+            return False
+        normal, pushed, se, pushed_path, _ = dialog.result
+        asset.source = dialog.state_sources["normal"]
+        asset.uv_rect = normal
+        asset.pressed_source = pushed_path
+        asset.pressed_uv_rect = pushed
+        asset.button_se = se
+        load_visual(asset)
+        return True
+
+    def add_member(self) -> None:
+        if len(self.members) >= self.MAX_MEMBERS:
+            messagebox.showwarning(APP_NAME, "スイッチは最大64個までです。", parent=self)
+            return
+        selected = filedialog.askopenfilename(parent=self,
+            title="スイッチのPNG/JPGまたはplistを選択",
+            initialdir=self.editor._dialog_initial_dir("toggle_uv"),
+            filetypes=[("画像 / plist", "*.png *.jpg *.jpeg *.plist")])
+        if not selected:
+            return
+        try:
+            source = ensure_asset_path(Path(selected))
+            name_hint = source.stem
+            off_rect: Optional[tuple[int, int, int, int]] = None
+            on_rect: Optional[tuple[int, int, int, int]] = None
+            on_path: Optional[Path] = None
+            se: Optional[str] = None
+            if source.suffix.casefold() == ".plist":
+                atlas = load_atlas(source)
+                if not atlas.frames:
+                    raise ValueError("plistにスプライトがありません。")
+                first = atlas.frames[0].name
+                picker = PlistButtonStateDialog(self, source, first, first,
+                                                 None, self.editor.audio["se"], toggle_mode=True)
+                if picker.result is None:
+                    return
+                off_key, on_key, se, _ = picker.result
+                by_name = {frame.name: frame for frame in atlas.frames}
+                off_image = extract_sprite(atlas.image, by_name[off_key])
+                on_image = extract_sprite(atlas.image, by_name[on_key])
+                source = generated_sprite_png(off_image)
+                on_path = generated_sprite_png(on_image)
+                off_rect = (0, 0, *off_image.size)
+                on_rect = (0, 0, *on_image.size)
+                name_hint = Path(off_key).stem
+            else:
+                with Image.open(source) as image:
+                    if image.width * image.height > MAX_IMAGE_PIXELS:
+                        raise ValueError("画像サイズが上限を超えています。")
+                    off_rect = (0, 0, image.width, image.height)
+                    on_rect = off_rect
+                candidate = Asset(name="switch", kind="toggle_uv", source=source,
+                                  uv_rect=off_rect, pressed_uv_rect=on_rect,
+                                  pressed_source=source)
+                if not self._select_uv(candidate):
+                    return
+                source, off_rect, on_rect = candidate.source, candidate.uv_rect, candidate.pressed_uv_rect
+                on_path, se = candidate.pressed_source, candidate.button_se
+            name = self._unique_member_name(name_hint)
+            asset = Asset(name=name, kind="toggle_uv", source=source,
+                          uv_rect=off_rect, pressed_uv_rect=on_rect,
+                          pressed_source=on_path, button_se=se, toggle_default="off")
+            load_visual(asset)
+            if asset.missing:
+                raise ValueError(asset.missing)
+            self.members.append(asset)
+            if len(self.members) == 1:
+                self.initial_var.set(asset.uid)
+            self.editor._remember_dialog_file("toggle_uv", source)
+            self.refresh_list()
+            self.tree.selection_set(asset.uid)
+            self.tree.see(asset.uid)
+        except (OSError, ValueError, TypeError, MemoryError, UnidentifiedImageError) as exc:
+            messagebox.showerror(APP_NAME, f"スイッチの追加に失敗しました:\n{exc}", parent=self)
+
+    def add_existing_member(self) -> None:
+        """Enroll existing scene toggles in the exclusive group, without duplication.
+
+        Only ungrouped scene-root toggles and members removed from this same
+        group in the pending dialog are eligible.  Existing image/UV/SE,
+        position, events, flags, and UID are preserved.  The scene is untouched
+        until the enclosing group's confirmation.
+        """
+        space = self.MAX_MEMBERS - len(self.members)
+        if space <= 0:
+            messagebox.showwarning(APP_NAME, "スイッチは最大64個までです。", parent=self)
+            return
+        used = {a.uid for a in self.members}
+        eligible = [a for a in self.editor.assets
+                    if a.kind == "toggle_uv" and a.event_owner_uid is None
+                    and a.toggle_group in (None, self.group) and a.uid not in used]
+        if not eligible:
+            messagebox.showinfo(APP_NAME,
+                "追加できる既存のトグルボタンがありません。\n"
+                "ほかの排他グループ所属や、イベント内のボタンは対象外です。", parent=self)
+            return
+        picker = tk.Toplevel(self)
+        picker.title("既存のトグルボタン追加")
+        picker.transient(self)
+        picker.minsize(430, 300)
+        body = ttk.Frame(picker, padding=12)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="グループに追加する配置済みトグルボタンを選択",
+                  font=("", 10, "bold")).pack(anchor="w")
+        ttk.Label(body, text="Ctrl / Shiftで複数選択できます。位置・UV・SE・イベントは維持されます。\n"
+                  "別グループに所属するスイッチは表示しません。",
+                  justify="left").pack(anchor="w", pady=(5, 8))
+        table_frame = ttk.Frame(body)
+        table_frame.pack(fill="both", expand=True)
+        tree = ttk.Treeview(table_frame, columns=("off", "on", "events"),
+                            show="tree headings", selectmode="extended", height=9)
+        tree.heading("#0", text="配置済みスイッチ名")
+        tree.heading("off", text="OFF画像")
+        tree.heading("on", text="ON画像")
+        tree.heading("events", text="イベント")
+        tree.column("#0", width=165, minwidth=115)
+        tree.column("off", width=110, minwidth=80)
+        tree.column("on", width=110, minwidth=80)
+        tree.column("events", width=75, minwidth=64, anchor="center", stretch=False)
+        tree.pack(side="left", fill="both", expand=True)
+        bar = ttk.Scrollbar(table_frame, orient="vertical", command=tree.yview)
+        bar.pack(side="right", fill="y")
+        tree.configure(yscrollcommand=bar.set)
+        for asset in eligible:
+            tree.insert("", "end", iid=asset.uid, text=asset.name,
+                        values=(asset.source.name,
+                                (asset.pressed_source or asset.source).name,
+                                len(asset.events)))
+        selected: list[str] = []
+        def accept(_event: Optional[tk.Event] = None) -> None:
+            chosen = set(tree.selection())
+            if not chosen:
+                messagebox.showinfo(APP_NAME, "追加するスイッチを選択してください。", parent=picker)
+                return
+            if len(chosen) > space:
+                messagebox.showwarning(APP_NAME,
+                    f"あと{space}個まで追加できます。選択数を減らしてください。", parent=picker)
+                return
+            selected.extend(a.uid for a in eligible if a.uid in chosen)
+            picker.destroy()
+        footer = ttk.Frame(body)
+        footer.pack(fill="x", pady=(10, 0))
+        ttk.Label(footer, text=f"追加可能: {space}個 / 複数選択可").pack(side="left")
+        ttk.Button(footer, text="キャンセル", command=picker.destroy).pack(side="right", padx=(6, 0))
+        ttk.Button(footer, text="選択したスイッチを追加", command=accept).pack(side="right")
+        tree.bind("<Double-1>", accept)
+        picker.bind("<Escape>", lambda _event: picker.destroy())
+        picker.bind("<Return>", accept)
+        self.editor._place_child_window(picker, self, (650, 410))
+        picker.grab_set()
+        picker.wait_window()
+        # Restore the parent dialog's modal grab after the nested selector closes.
+        if self.winfo_exists():
+            self.grab_set()
+        if not selected:
+            return
+        previous_count = len(self.members)
+        for uid in selected:
+            existing = self.editor._asset_by_uid(uid)
+            if existing is None:
+                continue
+            member = self.editor._asset_state_copy(existing)
+            self.members.append(member)
+            # A reused root asset already has an identity and event children;
+            # it must not be counted as new or have descendants duplicated.
+            self.original_uids.add(uid)
+        if previous_count == 0 and self.members:
+            self.initial_var.set(self.members[0].uid)
+        self.refresh_list()
+        if selected and self.tree.exists(selected[0]):
+            self.tree.selection_set(selected[0])
+            self.tree.focus(selected[0])
+            self.tree.see(selected[0])
+
+    def edit_member(self) -> None:
+        member = self._current()
+        if member is None:
+            return
+        try:
+            self._select_uv(member)
+            self.refresh_list()
+            self.tree.selection_set(member.uid)
+        except (OSError, ValueError, MemoryError) as exc:
+            messagebox.showerror(APP_NAME, str(exc), parent=self)
+
+    def remove_member(self) -> None:
+        member = self._current()
+        if member is None:
+            return
+        self.members = [a for a in self.members if a.uid != member.uid]
+        self.duplicate_sources.pop(member.uid, None)
+        if self.initial_var.get() == member.uid:
+            self.initial_var.set(self.members[0].uid if self.members else "")
+        self.refresh_list()
+
+    def confirm(self) -> None:
+        try:
+            name = safe_asset_key(self.name_var.get())
+            existing_groups = {a.toggle_group for a in self.editor.assets if a.toggle_group}
+            if name != self.group and name in existing_groups:
+                raise ValueError(f"グループ名 '{name}' は既に使用されています。")
+            if len(self.members) < 2:
+                raise ValueError("スイッチを2個以上登録してください。")
+            # Deep-copying event-show children also consumes asset slots. Verify
+            # the full tree before mutating the editor in the confirmation step.
+            templates = {a.uid: a for a in self.editor.assets}
+            def child_count(member: Asset, path: frozenset[str] = frozenset()) -> int:
+                if member.uid in path or len(path) > 32:
+                    raise ValueError("トグルイベントの参照に循環または深すぎる階層があります。")
+                path = path | {member.uid}
+                count = 0
+                for event in member.events:
+                    if event.get("type") != "show":
+                        continue
+                    child = templates.get(event.get("asset_uid"))
+                    if child is not None:
+                        count += 1 + child_count(child, path)
+                return count
+            new_members = [m for m in self.members if m.uid not in self.original_uids]
+            needed = len(new_members) + sum(child_count(m) for m in new_members)
+            if len(self.editor.assets) + needed > MAX_ASSETS:
+                raise ValueError("イベント内アセットを含めるとシーンのアセット数上限を超えます。")
+            initial_index = next((index for index, a in enumerate(self.members)
+                                  if a.uid == self.initial_var.get()), -1)
+            if initial_index < 0:
+                raise ValueError("初期ONのスイッチを指定してください。")
+            for m in self.members:
+                if m.kind != "toggle_uv":
+                    raise ValueError("グループにはトグルボタンのみ指定できます。")
+                if m.event_owner_uid is not None:
+                    raise ValueError("イベント内のトグルは排他グループに登録できません。")
+            self.result = (name, self.members, self.original_uids, initial_index,
+                           dict(self.duplicate_sources))
+            self.destroy()
+        except ValueError as exc:
+            messagebox.showerror(APP_NAME, str(exc), parent=self)
+
+
+class ScrollGroupDialog(tk.Toplevel):
+    """Create/edit/remove scroll viewports; include nested toggle-event assets."""
+    def __init__(self, editor: "SceneEditor", initial_name: Optional[str] = None,
+                 initial_bounds: Optional[tuple[float, float, float, float]] = None) -> None:
+        super().__init__(editor)
+        self.editor = editor
+        self.initial_bounds = initial_bounds
+        self.title("スクロールグループの設定")
+        self.geometry("670x650")
+        self.minsize(560, 510)
+        self.transient(editor)
+        self.groups = {k: copy.deepcopy(v) for k, v in editor.scroll_groups.items()}
+        self.available_assets = list(editor.assets)
+        self.active_name: Optional[str] = None
+        self.name_var = tk.StringVar()
+        self.entries = {k: tk.StringVar() for k in ("px", "py", "width", "height")}
+        self.allow_x = tk.BooleanVar(value=False)
+        self.allow_y = tk.BooleanVar(value=True)
+        self._construct()
+        self._refresh_groups()
+        if initial_name in self.groups:
+            self._load_group(initial_name)
+        else:
+            self._start_new()
+        self.grab_set()
+        self.focus_set()
+
+    def _construct(self) -> None:
+        header = ttk.Frame(self, padding=10)
+        header.pack(fill="x")
+        ttk.Label(header, text="登録済みグループ").pack(side="left")
+        self.group_select = ttk.Combobox(header, state="readonly", width=27)
+        self.group_select.pack(side="left", padx=7)
+        self.group_select.bind("<<ComboboxSelected>>", lambda _: self._load_group(self.group_select.get()))
+        ttk.Button(header, text="新規", command=self._start_new).pack(side="left", padx=3)
+        ttk.Button(header, text="削除", command=self._remove_group).pack(side="left", padx=3)
+        form = ttk.LabelFrame(self, text="グループ名と表示範囲（中心座標・シーン単位）", padding=10)
+        form.pack(fill="x", padx=10, pady=5)
+        ttk.Label(form, text="グループ名").grid(row=0, column=0, sticky="w")
+        ttk.Entry(form, textvariable=self.name_var).grid(row=0, column=1, columnspan=3, sticky="ew", pady=3)
+        for i, (key, label) in enumerate((("px", "中心 X"), ("py", "中心 Y"),
+                                         ("width", "幅"), ("height", "高さ"))):
+            r=1 + i//2
+            c=(i%2)*2
+            ttk.Label(form, text=label).grid(row=r, column=c, sticky="w", pady=4)
+            ttk.Entry(form, textvariable=self.entries[key], width=13).grid(row=r, column=c+1, sticky="ew", padx=(3,12), pady=4)
+        form.columnconfigure(1, weight=1)
+        form.columnconfigure(3, weight=1)
+        checks=ttk.Frame(form)
+        checks.grid(row=3, column=0, columnspan=4, sticky="w", pady=(6,1))
+        ttk.Checkbutton(checks, text="X軸スクロールを許可", variable=self.allow_x).pack(side="left", padx=(0,22))
+        ttk.Checkbutton(checks, text="Y軸スクロールを許可", variable=self.allow_y).pack(side="left")
+        ttk.Label(self, text="所属アセット（通常配置・トグルイベント内の両方に対応 / Ctrl・Shiftで複数選択）",
+                  padding=(12,8)).pack(anchor="w")
+        panel=ttk.Frame(self, padding=(12,0))
+        panel.pack(fill="both", expand=True)
+        self.members_box=tk.Listbox(panel, selectmode="extended", exportselection=False, activestyle="none")
+        self.members_box.pack(side="left", fill="both", expand=True)
+        bar=ttk.Scrollbar(panel, orient="vertical", command=self.members_box.yview)
+        bar.pack(side="right", fill="y")
+        self.members_box.configure(yscrollcommand=bar.set)
+        asset_names = {a.uid: a.name for a in self.editor.assets}
+        for a in self.available_assets:
+            if a.event_owner_uid:
+                owner_name = asset_names.get(a.event_owner_uid, "不明")
+                label = f"{a.name}   [{a.full_key}]  — トグルイベント内: {owner_name}"
+            else:
+                label = f"{a.name}   [{a.full_key}]  — 通常配置"
+            self.members_box.insert("end", label)
+        note=ttk.Label(self, text="ホイール: Y / Shift+ホイール: X / ドラッグ: 許可した方向へ移動\n"
+                  "表示範囲外の所属画像はプレビューで切り抜かれます。スクロール位置は保存しません。",
+                  foreground="#66727d", padding=(12,8))
+        note.pack(anchor="w")
+        actions=ttk.Frame(self, padding=(12,7))
+        actions.pack(fill="x")
+        ttk.Button(actions, text="配置画面を開く", command=self._open_layout).pack(side="left", padx=5)
+        ttk.Button(actions, text="適用して閉じる", command=self._apply).pack(side="right", padx=5)
+        ttk.Button(actions, text="キャンセル", command=self.destroy).pack(side="right", padx=5)
+
+    def _open_layout(self) -> None:
+        name = self.name_var.get().strip()
+        if name not in self.editor.scroll_groups:
+            messagebox.showinfo(APP_NAME, "先に「適用して閉じる」でグループを保存してください。", parent=self)
+            return
+        self.destroy()
+        self.editor.after_idle(lambda: self.editor.open_scroll_workspace(name))
+
+    def _refresh_groups(self) -> None:
+        self.group_select.configure(values=tuple(sorted(self.groups)))
+
+    def _start_new(self) -> None:
+        self.active_name = None
+        self.group_select.set("")
+        i=1
+        while f"scroll_{i}" in self.groups:
+            i+=1
+        self.name_var.set(f"scroll_{i}")
+        sx, sy = self.editor._pending_spawn
+        if self.initial_bounds is not None:
+            x0,y0,x1,y1 = self.initial_bounds
+            defaults = (("px", (x0+x1)/2), ("py", (y0+y1)/2),
+                        ("width", x1-x0), ("height", y1-y0))
+            self.initial_bounds = None  # Used only when first opening the new-group form.
+        else:
+            defaults = (("px",sx),("py",sy),("width",640),("height",360))
+        for k,v in defaults:
+            self.entries[k].set(jnum(v))
+        self.allow_x.set(False)
+        self.allow_y.set(True)
+        self.members_box.selection_clear(0, "end")
+        for i,asset in enumerate(self.available_assets):
+            if asset.uid in self.editor.selected_uids:
+                self.members_box.selection_set(i)
+
+    def _load_group(self, name: str) -> None:
+        group=self.groups.get(name)
+        if group is None:
+            return
+        self.active_name = name
+        self.group_select.set(name)
+        self.name_var.set(name)
+        for k in self.entries:
+            self.entries[k].set(jnum(getattr(group,k)))
+        self.allow_x.set(group.scroll_x)
+        self.allow_y.set(group.scroll_y)
+        self.members_box.selection_clear(0,"end")
+        for i,asset in enumerate(self.available_assets):
+            if asset.uid in group.members:
+                self.members_box.selection_set(i)
+
+    def _remove_group(self) -> None:
+        if self.active_name is None:
+            return
+        if not messagebox.askyesno(APP_NAME, f"グループ '{self.active_name}' を削除しますか？\nアセット自体は削除されません。", parent=self):
+            return
+        self.groups.pop(self.active_name, None)
+        self._refresh_groups()
+        self._commit()
+        self.destroy()
+
+    def _apply(self) -> None:
+        name=self.name_var.get().strip()
+        try:
+            safe_asset_key(name)
+            if name != self.active_name and name in self.groups:
+                raise ValueError("同名のグループが既にあります。")
+            values={k:scene_number(var.get(),k) for k,var in self.entries.items()}
+            if not (1 <= values["width"] <= DESIGN_W*4 and 1 <= values["height"] <= DESIGN_H*4):
+                raise ValueError("幅・高さは1以上、デザイン解像度の4倍以下にしてください。")
+            members={self.available_assets[i].uid for i in self.members_box.curselection()}
+        except (ValueError, TypeError) as exc:
+            messagebox.showerror(APP_NAME, f"スクロール設定を確認してください:\n{exc}", parent=self)
+            return
+        if self.active_name:
+            self.groups.pop(self.active_name, None)
+        for group in self.groups.values():
+            group.members.difference_update(members)
+        self.groups[name] = ScrollGroup(name, **values, scroll_x=self.allow_x.get(),
+                                         scroll_y=self.allow_y.get(), members=members)
+        try:
+            self._commit()
+        except ValueError as exc:
+            messagebox.showerror(APP_NAME, str(exc), parent=self)
+            return
+        self.destroy()
+
+    def _commit(self) -> None:
+        if self.editor.scroll_groups == self.groups:
+            return
+        # Reject self-referential gating, including changes to group memberships.
+        for owner in self.editor.assets:
+            if owner.kind not in ("toggle_uv", "button", "button_uv"):
+                continue
+            for event in owner.events:
+                if event.get("type") not in ("show_scroll_group", "hide_scroll_group", "toggle_scroll_group"):
+                    continue
+                previous = event["group_name"]
+                updated = (self.name_var.get().strip()
+                           if self.active_name == previous and previous not in self.groups
+                           and self.name_var.get().strip() in self.groups else previous)
+                if (updated in self.groups and owner.uid in self.groups[updated].members
+                        and event["type"] != "hide_scroll_group"):
+                    raise ValueError(
+                        f"{owner.name}: 自身の所属グループは表示・切替イベントで制御できません。")
+        self.editor._push_undo()
+        old_names = set(self.editor.scroll_groups)
+        renamed_from = self.active_name
+        renamed_to = self.name_var.get().strip()
+        self.editor.scroll_groups = copy.deepcopy(self.groups)
+        if (renamed_from and renamed_from != renamed_to and
+                self.editor.selected_scroll_group_name == renamed_from and
+                renamed_to in self.groups):
+            self.editor.selected_scroll_group_name = renamed_to
+        for owner in self.editor.assets:
+            if owner.kind not in ("toggle_uv", "button", "button_uv"):
+                continue
+            repaired_events = []
+            for event in owner.events:
+                if event["type"] not in ("show_scroll_group", "hide_scroll_group", "toggle_scroll_group"):
+                    repaired_events.append(event)
+                    continue
+                name = event["group_name"]
+                if renamed_from == name and renamed_to in self.groups and renamed_to != name:
+                    name = renamed_to
+                if name in self.groups:
+                    repaired_events.append({"type": event["type"], "group_name": name})
+            owner.events = repaired_events
+        self.editor.button_scroll_states = {
+            (renamed_to if k == renamed_from and renamed_to in self.groups else k): v
+            for k, v in self.editor.button_scroll_states.items()
+            if (renamed_to if k == renamed_from and renamed_to in self.groups else k) in self.groups}
+        self.editor._refresh_event_windows()
+        if self.editor.selected_scroll_group_name not in self.editor.scroll_groups:
+            self.editor.selected_scroll_group_name = None
+        self.editor.scroll_offsets.clear()
+        self.editor._drag_static_cache = None
+        self.editor.refresh_tree()
+        self.editor.request_draw("both")
+        self.editor.status_text.set(f"スクロールグループ: {len(self.groups)}件（プレビューで操作可能）")
+
+
+
+class ScrollWorkspacePicker(tk.Toplevel):
+    """Choose which scrolling content area to edit, without changing the scene."""
+    def __init__(self, editor: "SceneEditor") -> None:
+        super().__init__(editor)
+        self.result: Optional[str] = None
+        self.title("配置を編集するスクロールグループ")
+        self.transient(editor)
+        self.resizable(False, False)
+        frame = ttk.Frame(self, padding=16)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="配置編集するグループを選んでください。", padding=(0,0,0,8)).pack(anchor="w")
+        choice = ttk.Combobox(frame, state="readonly", width=36,
+                              values=list(editor.scroll_groups))
+        choice.pack(fill="x")
+        choice.current(0)
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x", pady=(12,0))
+        def accept(_event: Any = None) -> None:
+            self.result = choice.get()
+            self.destroy()
+        ttk.Button(buttons, text="配置画面を開く", command=accept).pack(side="left")
+        ttk.Button(buttons, text="キャンセル", command=self.destroy).pack(side="right")
+        choice.bind("<Return>", accept)
+        editor._place_child_window(self, editor, (420, 155))
+        self.grab_set()
+        self.wait_window()
+
+
+class ScrollWorkspaceDialog(tk.Toplevel):
+    """Unclipped, zoomable placement view for scroll-group children.
+
+    Coordinates are the *original scene coordinates*.  Assets can be positioned
+    beyond the 1920x1080 scene and the group clip without any scene-size clamp.
+    The viewport and scene borders are guides only; runtime preview still clips.
+    """
+    MIN_ZOOM, MAX_ZOOM = 0.035, 5.0
+
+    def __init__(self, editor: "SceneEditor", name: str) -> None:
+        super().__init__(editor)
+        self.editor = editor
+        self.name = name
+        group = editor.scroll_groups[name]
+        self.center_x, self.center_y = group.px, group.py
+        self.zoom = 0.78
+        self.selected: set[str] = set()
+        self.primary: Optional[str] = None
+        self.drag: Optional[dict[str, Any]] = None
+        self.images: list[ImageTk.PhotoImage] = []
+        self._photo_cache: dict[tuple[Any,...], ImageTk.PhotoImage] = {}
+        self._photo_pixels = 0
+        self.polygons: dict[str,list[tuple[float,float]]] = {}
+        self._drawing = False
+        self._draw_job: Optional[str] = None
+        self._syncing = False
+        self._snap_axes: tuple[Optional[float], Optional[float]] = (None, None)
+        self._spacing_guides: list[EqualGapSnap] = []
+        self.group_var = tk.StringVar(value=name)
+        self.details = tk.StringVar(value="クリックで選択、ドラッグで移動。表示範囲外にも配置できます。")
+        self.numbers: dict[str,tk.StringVar] = {k:tk.StringVar() for k in ('px','py','sx','sy','rotation')}
+        self.title(f"スクロールグループ配置画面 — {name}")
+        self.geometry(f"{min(1220,max(800,editor.winfo_screenwidth()-70))}x"
+                      f"{min(790,max(550,editor.winfo_screenheight()-85))}")
+        self.minsize(800,550)
+        self.transient(editor)
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self._construct()
+        self._refresh_members()
+        self._fit_job=self.after(100,self.fit_group)
+
+    @property
+    def group(self) -> ScrollGroup:
+        return self.editor.scroll_groups[self.name]
+
+    def _members(self) -> list[Asset]:
+        uids = self.group.members
+        # Event-owned assets also have editable scene-space transforms. Their
+        # visibility is still conditional on the owning toggle in preview.
+        return [a for a in self.editor.assets if a.uid in uids]
+
+    def _construct(self) -> None:
+        toolbar = ttk.Frame(self, padding=(10,8))
+        toolbar.pack(fill="x")
+        ttk.Label(toolbar, text="グループ:").pack(side="left")
+        self.choice = ttk.Combobox(toolbar, state="readonly", width=23,
+                                   textvariable=self.group_var,
+                                   values=list(self.editor.scroll_groups))
+        self.choice.pack(side="left", padx=(5,12))
+        self.choice.bind("<<ComboboxSelected>>",self.change_group)
+        ttk.Button(toolbar,text="表示範囲に合わせる",command=self.fit_group).pack(side="left",padx=2)
+        ttk.Button(toolbar,text="全アセットを表示",command=self.fit_all).pack(side="left",padx=2)
+        ttk.Button(toolbar,text="＋",width=3,command=lambda:self.zoom_at(1.25)).pack(side="left",padx=(14,2))
+        ttk.Button(toolbar,text="－",width=3,command=lambda:self.zoom_at(0.8)).pack(side="left",padx=2)
+        self.zoom_text=ttk.Label(toolbar,text="100%",width=8)
+        self.zoom_text.pack(side="left",padx=7)
+        ttk.Button(toolbar,text="グループ設定…",command=self.edit_group).pack(side="right",padx=2)
+        ttk.Button(toolbar,text="閉じる",command=self.close).pack(side="right",padx=2)
+        snap_row = ttk.Frame(self, padding=(11, 2))
+        snap_row.pack(fill='x')
+        ttk.Checkbutton(snap_row, text='位置スナップ', variable=self.editor.snap_enabled,
+                        command=self.request_draw).pack(side='left', padx=(0, 10))
+        ttk.Checkbutton(snap_row, text='等間隔スナップ', variable=self.editor.spacing_snap_enabled,
+                        command=self.request_draw).pack(side='left')
+        hint = ttk.Label(self,text="左ドラッグ: 配置 / ハンドル: 拡縮・回転 / 空白ドラッグ: 範囲選択 / Ctrl・Shift: 複数選択 / ホイール: ズーム / 中・右ドラッグ: パン / 矢印: 移動",
+                         foreground="#687887",padding=(11,4))
+        hint.pack(anchor="w")
+        panes=ttk.PanedWindow(self,orient="horizontal")
+        panes.pack(fill="both",expand=True,padx=8,pady=(3,4))
+        work=ttk.Frame(panes)
+        side=ttk.Frame(panes,width=290)
+        panes.add(work,weight=5)
+        panes.add(side,weight=2)
+        self.canvas=tk.Canvas(work,bg="#1b222c",highlightthickness=0,cursor="crosshair")
+        self.canvas.pack(fill="both",expand=True)
+        self.canvas.bind("<Configure>",lambda _e:self.request_draw())
+        self.canvas.bind("<ButtonPress-1>",self.press)
+        self.canvas.bind("<B1-Motion>",self.motion)
+        self.canvas.bind("<ButtonRelease-1>",self.release)
+        self.canvas.bind("<ButtonPress-2>",self.pan_press)
+        self.canvas.bind("<B2-Motion>",self.pan_motion)
+        self.canvas.bind("<ButtonRelease-2>",self.pan_release)
+        self.canvas.bind("<ButtonPress-3>",self.pan_press)
+        self.canvas.bind("<B3-Motion>",self.pan_motion)
+        self.canvas.bind("<ButtonRelease-3>",self.pan_release)
+        self.canvas.bind("<MouseWheel>",self.wheel)
+        self.canvas.bind("<Button-4>",self.wheel)
+        self.canvas.bind("<Button-5>",self.wheel)
+        self.canvas.bind("<Escape>",self.escape)
+        self.canvas.bind("<Control-z>",self.undo)
+        for key in ("Left","Right","Up","Down"):
+            self.canvas.bind(f"<{key}>",self.arrow)
+            self.canvas.bind(f"<Shift-{key}>",self.arrow)
+        ttk.Label(side,text="所属アセット（範囲外も表示）",padding=(6,5)).pack(anchor="w")
+        lst_frame=ttk.Frame(side)
+        lst_frame.pack(fill="both",expand=True,padx=4)
+        self.member_list=tk.Listbox(lst_frame,selectmode="extended",exportselection=False,
+                                    height=13,activestyle="none")
+        self.member_list.pack(side="left",fill="both",expand=True)
+        scroll=ttk.Scrollbar(lst_frame,orient="vertical",command=self.member_list.yview)
+        scroll.pack(side="right",fill="y")
+        self.member_list.config(yscrollcommand=scroll.set)
+        self.member_list.bind("<<ListboxSelect>>",self.list_select)
+        self.uid_list: list[str]=[]
+        controls=ttk.LabelFrame(side,text="選択したアセットの変換",padding=7)
+        controls.pack(fill="x",padx=5,pady=(12,5))
+        for i,(key,label) in enumerate((('px','位置 X'),('py','位置 Y'),
+                                         ('sx','拡大率 X'),('sy','拡大率 Y'),
+                                         ('rotation','回転（度）'))):
+            ttk.Label(controls,text=label).grid(row=i,column=0,sticky="w",pady=4)
+            field=ttk.Entry(controls,textvariable=self.numbers[key],width=18)
+            field.grid(row=i,column=1,sticky="ew",padx=6,pady=4)
+            field.bind("<Return>",lambda _e:self.apply_numbers())
+        controls.columnconfigure(1,weight=1)
+        ttk.Button(controls,text="座標・倍率・回転を反映",command=self.apply_numbers).grid(
+            row=5,column=0,columnspan=2,sticky="ew",pady=7)
+        ttk.Button(side,text="画像・UV設定を編集…",command=self.edit_uv).pack(
+            fill="x",padx=8,pady=3)
+        ttk.Button(side,text="グループの所属アセットを編集…",command=self.edit_group).pack(
+            fill="x",padx=8,pady=3)
+        ttk.Label(side,text="青枠: スクロール表示範囲（編集ガイド）\n灰色破線: 通常シーンの境界\n範囲外への配置にも制限はありません。",
+                  justify="left",foreground="#647888",padding=(9,10)).pack(anchor="w")
+        ttk.Label(self,textvariable=self.details,padding=(10,5),anchor="w").pack(fill="x")
+
+    def _map(self,x:float,y:float)->tuple[float,float]:
+        return (self.canvas.winfo_width()/2+(x-self.center_x)*self.zoom,
+                self.canvas.winfo_height()/2-(y-self.center_y)*self.zoom)
+
+    def _world(self,x:float,y:float)->tuple[float,float]:
+        return (self.center_x+(x-self.canvas.winfo_width()/2)/self.zoom,
+                self.center_y-(y-self.canvas.winfo_height()/2)/self.zoom)
+
+    def request_draw(self)->None:
+        if self.winfo_exists() and self._draw_job is None:
+            self._draw_job=self.after_idle(self.draw)
+
+    def _outline(self,asset:Asset)->list[tuple[float,float]]:
+        x0,y0,x1,y1=asset.bounds
+        return [self._map(*transform_local(asset,x,y)) for x,y in
+                ((x0,y1),(x1,y1),(x1,y0),(x0,y0))]
+
+    def _handles(self,a:Asset)->dict[str,tuple[float,float]]:
+        x0,y0,x1,y1=a.bounds
+        mx,my=(x0+x1)/2,(y0+y1)/2
+        loc={'nw':(x0,y1),'n':(mx,y1),'ne':(x1,y1),'e':(x1,my),
+             'se':(x1,y0),'s':(mx,y0),'sw':(x0,y0),'w':(x0,my)}
+        points={key:self._map(*transform_local(a,*xy)) for key,xy in loc.items()}
+        above=ROTATION_HANDLE_DISTANCE/max(self.zoom*a.sy,0.01)
+        points['rotate']=self._map(*transform_local(a,mx,y1+above))
+        return points
+
+    def draw(self)->None:
+        self._draw_job=None
+        if not self.winfo_exists() or self._drawing or self.name not in self.editor.scroll_groups:
+            return
+        self._drawing=True
+        try:
+            c=self.canvas
+            c.delete('all')
+            self.images=[]
+            self.polygons={}
+            cw,ch=max(1,c.winfo_width()),max(1,c.winfo_height())
+            # Soft grid follows the world camera and is not a placement constraint.
+            grid_step=200.0 if self.zoom>=0.3 else 500.0
+            l,b=self._world(0,ch)
+            r,t=self._world(cw,0)
+            for i in range(math.floor(l/grid_step),math.ceil(r/grid_step)+1):
+                x,_=self._map(i*grid_step,0)
+                c.create_line(x,0,x,ch,fill='#2a3440')
+            for i in range(math.floor(b/grid_step),math.ceil(t/grid_step)+1):
+                _,y=self._map(0,i*grid_step)
+                c.create_line(0,y,cw,y,fill='#2a3440')
+            # Gray dotted scene border: assets are free to cross it.
+            sleft,stop=self._map(-DESIGN_W/2,DESIGN_H/2)
+            sright,sbottom=self._map(DESIGN_W/2,-DESIGN_H/2)
+            c.create_rectangle(sleft,stop,sright,sbottom,outline='#738090',dash=(4,5))
+            g=self.group
+            x0,y0,x1,y1=g.bounds
+            vx0,vy0=self._map(x0,y1)
+            vx1,vy1=self._map(x1,y0)
+            c.create_rectangle(vx0,vy0,vx1,vy1,outline='#23d1e8',dash=(7,4),width=2)
+            c.create_text(vx0+6,vy0+5,anchor='nw',fill='#71e7f4',
+                          text=f'スクロール表示範囲: {g.name}  (X:{g.scroll_x} / Y:{g.scroll_y})')
+            for a in self._members():
+                corners=self._outline(a)
+                if not corners:
+                    continue
+                self.polygons[a.uid]=corners
+                minx,maxx=min(pt[0] for pt in corners),max(pt[0] for pt in corners)
+                miny,maxy=min(pt[1] for pt in corners),max(pt[1] for pt in corners)
+                if maxx<-250 or minx>cw+250 or maxy<-250 or miny>ch+250:
+                    continue
+                try:
+                    raster,_=asset_bitmap(a,0,self.zoom)
+                    bx0,by0,bx1,by1=a.bounds
+                    if a.kind=='toggle_uv' and a.toggle_default=='on' and a.pressed_image is not None:
+                        raster=a.pressed_image
+                        iw,ih=raster.size
+                    elif a.kind=='window':
+                        iw,ih=raster.size
+                    else:
+                        iw,ih=bx1-bx0,by1-by0
+                    w=max(1,round(iw*self.zoom*(1 if a.kind=='window' else a.sx)))
+                    h=max(1,round(ih*self.zoom*(1 if a.kind=='window' else a.sy)))
+                    if w*h<=MAX_RENDER_PIXELS and w<=8192 and h<=8192:
+                        key=(a.uid,id(raster),w,h,round(a.rotation,8),a.flip_x,a.flip_y)
+                        photo=self._photo_cache.get(key)
+                        if photo is None:
+                            sampler=RESAMPLE_NEAREST if a.kind=='window' else RESAMPLE
+                            scaled=raster.resize((w,h),sampler)
+                            scaled=apply_scene_flips(scaled,a)
+                            scaled=scaled.rotate(math.degrees(a.rotation),expand=True,resample=sampler)
+                            photo=ImageTk.PhotoImage(scaled)
+                            # Keep per-workspace texture cache bounded when editing
+                            # scenes with hundreds of large scrolling sprites.
+                            pixels=scaled.width*scaled.height
+                            while self._photo_cache and (len(self._photo_cache)>=96 or
+                                   self._photo_pixels+pixels>18_000_000):
+                                oldest=next(iter(self._photo_cache))
+                                removed=self._photo_cache.pop(oldest)
+                                self._photo_pixels-=removed.width()*removed.height()
+                            if pixels<=18_000_000:
+                                self._photo_cache[key]=photo
+                                self._photo_pixels+=pixels
+                        self.images.append(photo)
+                        mx,my=(bx0+bx1)/2,(by0+by1)/2
+                        sx,sy=self._map(*transform_local(a,mx,my))
+                        c.create_image(sx,sy,image=photo,anchor='center')
+                except (OSError,ValueError,MemoryError,ZeroDivisionError) as exc:
+                    self.details.set(f'{a.name}: 描画できません: {exc}')
+                border=SELECTION_COLOR if a.uid in self.selected else '#718297'
+                c.create_polygon(*sum(([x,y] for x,y in corners),[]),
+                                 outline=border,fill='',width=2 if a.uid in self.selected else 1)
+            # Display-viewport overlay is always on top of images for clarity.
+            c.create_rectangle(vx0,vy0,vx1,vy1,outline='#28ddf0',dash=(7,4),width=2)
+            primary=self._asset(self.primary)
+            if primary is not None and len(self.selected)==1:
+                handles=self._handles(primary)
+                c.create_line(*handles['n'],*handles['rotate'],fill=SELECTION_COLOR,width=2)
+                for label,(x,y) in handles.items():
+                    if label=='rotate':
+                        c.create_oval(x-6,y-6,x+6,y+6,outline=SELECTION_COLOR,fill='#263d54',width=2)
+                    else:
+                        c.create_rectangle(x-5,y-5,x+5,y+5,outline='#143446',fill='#f0fbff',width=1)
+            if self.drag and self.drag.get('mode')=='marquee':
+                x,y=self.drag['screen']
+                ex,ey=self.drag['last']
+                c.create_rectangle(x,y,ex,ey,outline='#ffcd76',dash=(4,3),width=2)
+            guide_x, guide_y = self._snap_axes
+            if self.drag is not None and self.editor.snap_enabled.get():
+                if guide_x is not None:
+                    guide_sx, _ = self._map(guide_x, 0)
+                    c.create_line(guide_sx, 0, guide_sx, ch, fill=SNAP_GUIDE_COLOR,
+                                  dash=SNAP_GUIDE_DASH, width=1)
+                if guide_y is not None:
+                    _, guide_sy = self._map(0, guide_y)
+                    c.create_line(0, guide_sy, cw, guide_sy, fill=SNAP_GUIDE_COLOR,
+                                  dash=SNAP_GUIDE_DASH, width=1)
+            if self.drag is not None and self.editor.spacing_snap_enabled.get():
+                for gline in self._spacing_guides:
+                    for start, end in gline.intervals:
+                        if gline.axis == 'x':
+                            xa, ya = self._map(start, gline.perpendicular)
+                            xb, _ = self._map(end, gline.perpendicular)
+                        else:
+                            xa, ya = self._map(gline.perpendicular, start)
+                            _, yb = self._map(gline.perpendicular, end)
+                        if gline.axis == 'x':
+                            c.create_line(xa, ya, xb, ya, fill='#47d7c0', width=2,
+                                          arrow=tk.BOTH)
+                        else:
+                            c.create_line(xa, ya, xa, yb, fill='#47d7c0', width=2,
+                                          arrow=tk.BOTH)
+            self.zoom_text.config(text=f'{self.zoom*100:.0f}%')
+        finally:
+            self._drawing=False
+
+    def _asset(self,uid:Optional[str])->Optional[Asset]:
+        return self.editor._asset_by_uid(uid) if uid else None
+
+    def _refresh_members(self)->None:
+        self._syncing=True
+        try:
+            self.member_list.delete(0,'end')
+            self.uid_list=[]
+            for a in self._members():
+                self.uid_list.append(a.uid)
+                self.member_list.insert('end',f'{a.name}  ({a.kind})')
+            for i,uid in enumerate(self.uid_list):
+                if uid in self.selected:
+                    self.member_list.selection_set(i)
+        finally:
+            self._syncing=False
+        self._sync_numbers()
+        self.request_draw()
+
+    def _select(self,uids:set[str],primary:Optional[str]=None)->None:
+        available=set(self.uid_list)
+        self.selected=set(uids)&available
+        self.primary=(primary if primary in self.selected else next(iter(self.selected),None))
+        self._syncing=True
+        try:
+            self.member_list.selection_clear(0,'end')
+            for i,uid in enumerate(self.uid_list):
+                if uid in self.selected:
+                    self.member_list.selection_set(i)
+        finally:
+            self._syncing=False
+        self._sync_numbers()
+        self.request_draw()
+
+    def _sync_numbers(self)->None:
+        a=self._asset(self.primary)
+        for key,v in self.numbers.items():
+            value=(math.degrees(a.rotation) if key=='rotation' else getattr(a,key)) if a is not None else ''
+            v.set(jnum(value) if a is not None else '')
+        if a is not None:
+            self.details.set(f'{a.name}: X={a.px:.1f}, Y={a.py:.1f} / 選択 {len(self.selected)}件')
+
+    def list_select(self,_e:Any=None)->None:
+        if self._syncing:
+            return
+        chosen={self.uid_list[i] for i in self.member_list.curselection() if i<len(self.uid_list)}
+        self._select(chosen,next(iter(chosen),None))
+        self.canvas.focus_set()
+
+    def _hit(self,x:float,y:float)->Optional[Asset]:
+        for a in reversed(self._members()):
+            pts=self.polygons.get(a.uid)
+            if pts and inside_polygon(x,y,pts):
+                return a
+        return None
+
+    def _workspace_snap_refs(self, moving: set[str]) -> tuple[list[float],list[float],tuple[tuple[float,float,float,float],...]]:
+        """Group viewport, scene edges and other group members are snap references."""
+        gx0,gy0,gx1,gy1 = self.group.bounds
+        ref_x = [-DESIGN_W/2, 0.0, DESIGN_W/2, gx0, (gx0+gx1)/2, gx1]
+        ref_y = [-DESIGN_H/2, 0.0, DESIGN_H/2, gy0, (gy0+gy1)/2, gy1]
+        others = []
+        for asset in self._members():
+            if asset.uid in moving:
+                continue
+            x0,y0,x1,y1 = asset_world_aabb(asset)
+            ref_x.extend((x0,(x0+x1)/2,x1))
+            ref_y.extend((y0,(y0+y1)/2,y1))
+            others.append((x0,y0,x1,y1))
+        return sorted(ref_x),sorted(ref_y),tuple(others)
+
+    def _snap_workspace_position(self, original_bounds: tuple[float,float,float,float],
+                                 dx: float, dy: float, drag:dict[str,Any]
+                                 ) -> tuple[float,float]:
+        x0,y0,x1,y1 = original_bounds
+        box = (x0+dx,y0+dy,x1+dx,y1+dy)
+        threshold = SNAP_DISTANCE_PX / max(self.zoom,0.001)
+        cx=cy=0.0
+        gx=gy=None
+        self._spacing_guides=[]
+        if self.editor.snap_enabled.get():
+            cx,gx = nearest_snap((box[0],(box[0]+box[2])/2,box[2]),drag['refs_x'],threshold)
+            cy,gy = nearest_snap((box[1],(box[1]+box[3])/2,box[3]),drag['refs_y'],threshold)
+        if self.editor.spacing_snap_enabled.get():
+            for axis in ('x','y'):
+                found=equal_gap_snap(box,drag['spacing_boxes'],axis,threshold,
+                                     proximity=threshold*2)
+                if found is None:
+                    continue
+                if axis=='x' and (gx is None or abs(found.delta)<=abs(cx)):
+                    cx,gx=found.delta,None
+                    self._spacing_guides.append(found)
+                elif axis=='y' and (gy is None or abs(found.delta)<=abs(cy)):
+                    cy,gy=found.delta,None
+                    self._spacing_guides.append(found)
+        self._snap_axes=(gx,gy)
+        return dx+cx,dy+cy
+
+    def press(self,e:tk.Event)->None:
+        self.canvas.focus_set()
+        wxy=self._world(e.x,e.y)
+        selected_asset=self._asset(self.primary) if len(self.selected)==1 else None
+        handle=None
+        if selected_asset is not None:
+            for name,(x,y) in self._handles(selected_asset).items():
+                if math.hypot(e.x-x,e.y-y)<9:
+                    handle=name
+                    break
+        a=selected_asset if handle else self._hit(e.x,e.y)
+        add=bool(e.state&0x1)
+        toggle=bool(e.state&0x4)
+        if a is None:
+            self.drag={'mode':'marquee','screen':(e.x,e.y),'last':(e.x,e.y),
+                       'add':add,'base':set(self.selected)}
+            if not add:
+                self._select(set())
+            return
+        if toggle:
+            choice=set(self.selected)
+            if a.uid in choice: choice.remove(a.uid)
+            else: choice.add(a.uid)
+            self._select(choice,a.uid)
+            return
+        if add:
+            self._select(self.selected|{a.uid},a.uid)
+            return
+        if a.uid not in self.selected:
+            self._select({a.uid},a.uid)
+        changed=[item for item in self._members() if item.uid in self.selected]
+        before=self.editor._snapshot()
+        self._snap_axes=(None,None)
+        self._spacing_guides=[]
+        refs_x,refs_y,spacing_boxes=self._workspace_snap_refs({item.uid for item in changed})
+        bounds=[asset_world_aabb(item) for item in changed]
+        initial_box=(min(b[0] for b in bounds),min(b[1] for b in bounds),
+                     max(b[2] for b in bounds),max(b[3] for b in bounds))
+        drag={'refs_x':refs_x,'refs_y':refs_y,'spacing_boxes':spacing_boxes,
+              'initial_box':initial_box,'mode':'rotate' if handle=='rotate' else 'resize' if handle else 'move',
+              'start':wxy,'members':changed,
+              'originals':{item.uid:(item.px,item.py,item.sx,item.sy,item.rotation) for item in changed},
+              'before':before,'asset':a,'handle':handle,'changed':False}
+        if handle=='rotate':
+            drag['angle']=math.atan2(wxy[1]-a.py,wxy[0]-a.px)
+        elif handle:
+            x0,y0,x1,y1=a.bounds
+            mx,my=(x0+x1)/2,(y0+y1)/2
+            lx=x0 if 'w' in handle else x1 if 'e' in handle else mx
+            ly=y1 if 'n' in handle else y0 if 's' in handle else my
+            ox=x1 if 'w' in handle else x0 if 'e' in handle else mx
+            oy=y0 if 'n' in handle else y1 if 's' in handle else my
+            drag.update(local=(lx,ly),opposite=(ox,oy),
+                        fixed=transform_local(a,ox,oy))
+        self.drag=drag
+
+    def motion(self,e:tk.Event)->None:
+        d=self.drag
+        if d is None:return
+        if d['mode']=='marquee':
+            d['last']=(e.x,e.y)
+            self.request_draw()
+            return
+        world=self._world(e.x,e.y)
+        mode=d['mode']
+        self._snap_axes=(None,None)
+        self._spacing_guides=[]
+        if mode=='move':
+            delta=self._snap_workspace_position(d['initial_box'],
+                        world[0]-d['start'][0],world[1]-d['start'][1],d)
+            for a in d['members']:
+                px,py,_,_,_=d['originals'][a.uid]
+                a.px=px+delta[0]
+                a.py=py+delta[1]
+        elif mode=='rotate':
+            a=d['asset']
+            px,py,_,_,rot=d['originals'][a.uid]
+            angle=math.atan2(world[1]-py,world[0]-px)
+            diff=math.atan2(math.sin(angle-d['angle']),math.cos(angle-d['angle']))
+            a.rotation=rot+diff
+            if e.state&0x1:
+                a.rotation=round(a.rotation/(math.pi/12))*(math.pi/12)
+        else:
+            a=d['asset']
+            if self.editor.snap_enabled.get() and not (e.state & 0x1):
+                threshold=SNAP_DISTANCE_PX/max(self.zoom,0.001)
+                cx,gx=nearest_snap((world[0],),d['refs_x'],threshold)
+                cy,gy=nearest_snap((world[1],),d['refs_y'],threshold)
+                world=(world[0]+cx,world[1]+cy)
+                self._snap_axes=(gx,gy)
+            px,py,sx,sy,rot=d['originals'][a.uid]
+            ox,oy=d['fixed']
+            cs,sn=math.cos(rot),math.sin(rot)
+            dx,dy=world[0]-ox,world[1]-oy
+            invx,invy=cs*dx+sn*dy,-sn*dx+cs*dy
+            lx,ly=d['local']; olx,oly=d['opposite']
+            nsx=sx if lx==olx else max(MIN_SCALE,min(MAX_SCALE,invx/(lx-olx)))
+            nsy=sy if ly==oly else max(MIN_SCALE,min(MAX_SCALE,invy/(ly-oly)))
+            if e.state&0x1 and lx!=olx and ly!=oly:
+                f=max(nsx/sx,nsy/sy)
+                nsx=max(MIN_SCALE,min(MAX_SCALE,sx*f))
+                nsy=max(MIN_SCALE,min(MAX_SCALE,sy*f))
+            if a.kind=='window':
+                minx,miny=window_min_scales(a)
+                nsx=max(nsx,minx);nsy=max(nsy,miny)
+            a.sx,a.sy=nsx,nsy
+            a.px=ox-(cs*nsx*olx-sn*nsy*oly)
+            a.py=oy-(sn*nsx*olx+cs*nsy*oly)
+        d['changed']=True
+        self._sync_numbers()
+        self.request_draw()
+
+    def release(self,_e:Any=None)->None:
+        d=self.drag
+        self.drag=None
+        self._snap_axes=(None,None)
+        self._spacing_guides=[]
+        if not d:return
+        if d['mode']=='marquee':
+            x0,y0=d['screen']; x1,y1=d['last']
+            left,right=sorted((x0,x1));top,bottom=sorted((y0,y1))
+            chosen=set(d['base']) if d['add'] else set()
+            for uid,pts in self.polygons.items():
+                if (min(x for x,y in pts)<=right and max(x for x,y in pts)>=left and
+                    min(y for x,y in pts)<=bottom and max(y for x,y in pts)>=top):
+                    chosen.add(uid)
+            self._select(chosen)
+            return
+        changed=any((a.px,a.py,a.sx,a.sy,a.rotation)!=d['originals'][a.uid]
+                    for a in d['members'])
+        if changed:
+            self.editor._push_undo(d['before'])
+            self.editor._drag_static_cache=None
+            self.editor.request_draw('both')
+            self.editor.status_text.set(f'{self.name}: 配置を更新しました。Ctrl+Zで取り消せます。')
+        self._sync_numbers()
+        self.request_draw()
+
+    def escape(self,_e:Any=None)->str:
+        self._snap_axes=(None,None)
+        self._spacing_guides=[]
+        d=self.drag
+        if d:
+            for a in d.get('members',[]):
+                a.px,a.py,a.sx,a.sy,a.rotation=d['originals'][a.uid]
+            self.drag=None
+            self.request_draw()
+        else:
+            self._select(set())
+        return 'break'
+
+    def pan_press(self,e:tk.Event)->None:
+        self.drag={'mode':'pan','start':(e.x,e.y),'center':(self.center_x,self.center_y)}
+
+    def pan_motion(self,e:tk.Event)->None:
+        d=self.drag
+        if not d or d['mode']!='pan':return
+        self.center_x=d['center'][0]-(e.x-d['start'][0])/self.zoom
+        self.center_y=d['center'][1]+(e.y-d['start'][1])/self.zoom
+        self.request_draw()
+
+    def pan_release(self,_e:Any=None)->None:
+        if self.drag and self.drag.get('mode')=='pan':self.drag=None
+
+    def zoom_at(self,factor:float,x:Optional[float]=None,y:Optional[float]=None)->None:
+        cx=self.canvas.winfo_width()/2 if x is None else x
+        cy=self.canvas.winfo_height()/2 if y is None else y
+        before=self._world(cx,cy)
+        self.zoom=max(self.MIN_ZOOM,min(self.MAX_ZOOM,self.zoom*factor))
+        after=self._world(cx,cy)
+        self.center_x+=before[0]-after[0]
+        self.center_y+=before[1]-after[1]
+        self.request_draw()
+
+    def wheel(self,e:tk.Event)->str:
+        delta=getattr(e,'delta',0)
+        if not delta:
+            delta=120 if getattr(e,'num',0)==4 else -120
+        self.zoom_at(1.15 if delta>0 else 1/1.15,e.x,e.y)
+        return 'break'
+
+    def _fit_bounds(self,x0:float,y0:float,x1:float,y1:float)->None:
+        width=max(x1-x0,1)
+        height=max(y1-y0,1)
+        cw=max(120,self.canvas.winfo_width())
+        ch=max(120,self.canvas.winfo_height())
+        self.center_x=(x0+x1)/2
+        self.center_y=(y0+y1)/2
+        self.zoom=max(self.MIN_ZOOM,min(self.MAX_ZOOM,min(cw/(width*1.4),ch/(height*1.4))))
+        self.request_draw()
+
+    def fit_group(self)->None:
+        self._fit_bounds(*self.group.bounds)
+
+    def fit_all(self)->None:
+        b=list(self.group.bounds)
+        for a in self._members():
+            x0,y0,x1,y1=asset_world_aabb(a)
+            b[0]=min(b[0],x0);b[1]=min(b[1],y0)
+            b[2]=max(b[2],x1);b[3]=max(b[3],y1)
+        self._fit_bounds(*b)
+
+    def arrow(self,e:tk.Event)->str:
+        if not self.selected:return 'break'
+        step=10 if e.state&0x1 else 1
+        dx=(step if e.keysym=='Right' else -step if e.keysym=='Left' else 0)
+        dy=(step if e.keysym=='Up' else -step if e.keysym=='Down' else 0)
+        if not dx and not dy:return 'break'
+        self.editor._push_undo()
+        for a in self._members():
+            if a.uid in self.selected:
+                a.px+=dx;a.py+=dy
+        self.editor.request_draw('both')
+        self._sync_numbers();self.request_draw()
+        return 'break'
+
+    def apply_numbers(self)->None:
+        a=self._asset(self.primary)
+        if a is None:return
+        try:
+            values={key:scene_number(var.get(),key) for key,var in self.numbers.items()}
+            if not MIN_SCALE<=values['sx']<=MAX_SCALE or not MIN_SCALE<=values['sy']<=MAX_SCALE:
+                raise ValueError('倍率が範囲外です。')
+            if a.kind=='window':
+                mx,my=window_min_scales(a)
+                if values['sx']<mx or values['sy']<my:
+                    raise ValueError('ウィンドウの角を維持できない倍率です。')
+        except ValueError as exc:
+            messagebox.showerror(APP_NAME,f'値が不正です: {exc}',parent=self)
+            return
+        updated=(values['px'],values['py'],values['sx'],values['sy'],math.radians(values['rotation']))
+        if (a.px,a.py,a.sx,a.sy,a.rotation)==updated:return
+        self.editor._push_undo()
+        a.px,a.py,a.sx,a.sy,a.rotation=updated
+        self.editor.request_draw('both')
+        self._sync_numbers();self.request_draw()
+
+    def edit_uv(self)->None:
+        a=self._asset(self.primary)
+        if a is None:return
+        self.editor.select(a.uid)
+        if a.kind=='window':self.editor.edit_selected_window()
+        else:self.editor.edit_selected_uv()
+        self.request_draw()
+
+    def edit_group(self)->None:
+        dialog=self.editor.edit_scroll_groups(self.name)
+        self.wait_window(dialog)
+        if not self.winfo_exists():
+            return
+        if self.name not in self.editor.scroll_groups:
+            self.close()
+            return
+        self._photo_cache.clear()
+        self._photo_pixels=0
+        self._refresh_members()
+
+    def change_group(self,_e:Any=None)->None:
+        name=self.group_var.get()
+        if name not in self.editor.scroll_groups:return
+        self.name=name
+        self.title(f'スクロールグループ配置画面 — {name}')
+        self.selected.clear();self.primary=None
+        self._refresh_members();self.fit_group()
+
+    def undo(self,_e:Any=None)->str:
+        self.editor.undo()
+        if self.name not in self.editor.scroll_groups:
+            self.close()
+        else:
+            self._refresh_members()
+        return 'break'
+
+    def close(self)->None:
+        if getattr(self,'_fit_job',None) is not None:
+            self.after_cancel(self._fit_job)
+            self._fit_job=None
+        if self.drag and self.drag.get('mode') in ('move','rotate','resize'):
+            self.release()
+        if self._draw_job is not None:
+            self.after_cancel(self._draw_job)
+            self._draw_job=None
+        self._photo_cache.clear()
+        self.editor._scroll_workspace=None
+        self.destroy()
 
 
 class SceneEditor(tk.Tk):
@@ -5418,7 +7239,20 @@ class SceneEditor(tk.Tk):
         self.scene_name = tk.StringVar(value=DEFAULT_SCENE)
         self.status_text = tk.StringVar(value="編集画面を右クリックするとアセットを配置できます。")
         self.assets: list[Asset] = []
+        self.scroll_groups: dict[str, ScrollGroup] = {}
+        self.scroll_offsets: dict[str, tuple[float, float]] = {}
+        self._scroll_press: Optional[dict[str, Any]] = None
+        self._scroll_dispatch_click = False
+        self.selected_scroll_group_name: Optional[str] = None  # Editor-only viewport selection.
+        self.selection_mode = tk.StringVar(value="asset")  # Asset or scroll viewport hit testing.
+        self._scroll_workspace: Optional[tk.Toplevel] = None
+        self._scroll_create_mode = False  # Drag on canvas to define a new viewport.
+
         self.selected_uid: Optional[str] = None
+        self.selected_uids: set[str] = set()
+        self._syncing_tree_selection = False
+        self._group_drag_photos: list[ImageTk.PhotoImage] = []
+        self._group_drag_items: dict[str, int] = {}
         self.background_file: Optional[Path] = None
         self.background_image: Optional[Image.Image] = None
         self.background_critical = True
@@ -5428,6 +7262,12 @@ class SceneEditor(tk.Tk):
         self.audio: dict[str, dict[str, dict[str, str]]] = {"bgm": {}, "se": {}}
         self.audio_flags: dict[str, tuple[bool, bool]] = {}
         self.audio_player = AudioPlayer(self, self.status_text)
+        self.preview_bgm_volume_var = tk.DoubleVar(value=self.audio_player.volumes['bgm'])
+        self.preview_se_volume_var = tk.DoubleVar(value=self.audio_player.volumes['se'])
+        self.preview_volume_text = {
+            'bgm': tk.StringVar(value=f"{self.audio_player.volumes['bgm']}%"),
+            'se': tk.StringVar(value=f"{self.audio_player.volumes['se']}%"),
+        }
         self.saved_path: Optional[Path] = None
         # All scene saves are fixed to ./out/scene; asset dialogs keep per-type history.
         self._last_asset_dir: Optional[Path] = None
@@ -5442,7 +7282,9 @@ class SceneEditor(tk.Tk):
         self._drag: Optional[dict[str, Any]] = None
         self.snap_enabled = tk.BooleanVar(value=True)
         self.spacing_snap_enabled = tk.BooleanVar(value=True)
-        self.editor_hidden_uids: set[str] = set()  # editor-only; excluded from JSON and preview.
+        self.editor_hidden_uids: set[str] = set()  # Temporary editor visibility; never serialized.
+        self.preview_sync_visibility = tk.BooleanVar(value=False)  # Manual editor mask -> preview.
+        self.editor_sync_preview_visibility = tk.BooleanVar(value=False)  # Preview events/states -> edit viewport.
         self._pending_spawn = (0.0, 0.0)
         self._needs_draw: Optional[str] = None
         self._draw_job: Optional[str] = None
@@ -5450,6 +7292,7 @@ class SceneEditor(tk.Tk):
         self.last_frame: dict[str, int] = {}
         self.pressed_button_uid: Optional[str] = None
         self.toggle_states: dict[str, str] = {}  # preview state; persisted initial state lives on Asset
+        self.button_scroll_states: dict[str, bool] = {}  # preview-only latched button commands, by group name
         self._tick_job: Optional[str] = None
         self._property_updating = False
         # Property numbers are adjusted with the wheel rather than label dragging.
@@ -5457,6 +7300,7 @@ class SceneEditor(tk.Tk):
         # Editing state snapshots hold references to decoded images; never duplicate pixel buffers.
         self._undo_stack: list[dict[str, Any]] = []
         self._asset_clipboard: Optional[Asset] = None  # Internal clipboard; share decoded image buffers.
+        self._asset_clipboard_scroll_group: Optional[str] = None
         self._asset_row_drag_source: Optional[str] = None
         self._asset_row_drag_start_y = 0
         self._asset_row_drag_changed = False
@@ -5508,14 +7352,44 @@ class SceneEditor(tk.Tk):
         main = ttk.PanedWindow(self, orient="horizontal")
         main.pack(fill="both", expand=True, padx=8, pady=(0, 6))
         left = ttk.Frame(main)
-        right = ttk.Frame(main)
+        right_shell = ttk.Frame(main)
         main.add(left, weight=7)
-        main.add(right, weight=4)
+        main.add(right_shell, weight=4)
+        # Scrollable inspector keeps all editing controls accessible on 720p screens.
+        self.inspector_canvas = tk.Canvas(right_shell, highlightthickness=0, borderwidth=0,
+                                          bg="#f0f0f0", width=445)
+        inspector_scroll = ttk.Scrollbar(right_shell, orient="vertical",
+                                         command=self.inspector_canvas.yview)
+        inspector_scroll.pack(side="right", fill="y")
+        self.inspector_canvas.pack(side="left", fill="both", expand=True)
+        self.inspector_canvas.configure(yscrollcommand=inspector_scroll.set)
+        right = ttk.Frame(self.inspector_canvas)
+        right_id = self.inspector_canvas.create_window((0, 0), window=right, anchor="nw")
+        right.bind("<Configure>", lambda _: self.inspector_canvas.configure(
+            scrollregion=self.inspector_canvas.bbox("all")))
+        self.inspector_canvas.bind("<Configure>", lambda e: self.inspector_canvas.itemconfigure(
+            right_id, width=e.width))
+        self.inspector_canvas.bind("<MouseWheel>", lambda e: self.inspector_canvas.yview_scroll(
+            -1 if e.delta > 0 else 1, "units"))
+        self.inspector_canvas.bind("<Button-4>", lambda _: self.inspector_canvas.yview_scroll(-1, "units"))
+        self.inspector_canvas.bind("<Button-5>", lambda _: self.inspector_canvas.yview_scroll(1, "units"))
 
         edit_header = ttk.Frame(left)
         edit_header.pack(fill="x")
-        ttk.Label(edit_header, text="編集画面  |  16:9  |  ドラッグで移動 / 四隅で拡縮 / 上の丸で回転",
+        ttk.Label(edit_header, text="編集画面（16:9） | 移動・拡縮・回転",
                   padding=(3, 5)).pack(side="left")
+        mode_controls = ttk.Frame(left)
+        mode_controls.pack(fill="x", padx=4, pady=(0, 3))
+        ttk.Label(mode_controls, text="編集対象:").pack(side="left", padx=(0, 4))
+        ttk.Radiobutton(mode_controls, text="アセット", value="asset",
+                        variable=self.selection_mode, command=self._on_selection_mode_change).pack(side="left", padx=3)
+        ttk.Radiobutton(mode_controls, text="スクロールグループ", value="scroll",
+                        variable=self.selection_mode, command=self._on_selection_mode_change).pack(side="left", padx=3)
+        ttk.Button(mode_controls, text="選択グループの配置画面を開く…",
+                   command=self.open_scroll_workspace).pack(side="right", padx=2)
+        ttk.Checkbutton(edit_header, text="プレビュー表示と同期",
+                        variable=self.editor_sync_preview_visibility,
+                        command=self._on_editor_visibility_sync_change).pack(side="right", padx=(5, 4))
         ttk.Checkbutton(edit_header, text="等間隔スナップ", variable=self.spacing_snap_enabled,
                         command=self._toggle_spacing_snap).pack(side="right", padx=(6, 4))
         ttk.Checkbutton(edit_header, text="位置スナップ", variable=self.snap_enabled,
@@ -5529,30 +7403,78 @@ class SceneEditor(tk.Tk):
         self.edit_canvas.bind("<Button-3>", self.editor_context)
         self.edit_canvas.bind("<Delete>", lambda _: self.delete_selected())
         self.edit_canvas.bind("<Control-d>", lambda _: self.duplicate_selected())
-        self.edit_canvas.bind("<Escape>", lambda _: self.select(None))
+        self.edit_canvas.bind("<Escape>", self._escape_editor)
+        self.edit_canvas.bind("<Motion>", self._editor_hover)
         for key in ("Left", "Right", "Up", "Down"):
             self.edit_canvas.bind(f"<{key}>", self.move_with_arrow)
             self.edit_canvas.bind(f"<Shift-{key}>", self.move_with_arrow)
-        hint = ttk.Label(left, text="ショートカット: Ctrl+C コピー / Ctrl+V 貼り付け / Ctrl+Z 取り消し / Delete 削除 / Ctrl+D 複製 / 矢印キー移動 / Ctrl+S 保存",
+        hint = ttk.Label(left, text="アセットモード: 通常UIの選択・移動 | グループモード: 水色枠の移動・範囲変更 | 所属UIの配置は別画面",
                          foreground="#6c7682", padding=(3, 6))
         hint.pack(anchor="w")
 
-        ttk.Label(right, text="プレビュー  |  16:9  |  アニメーション再生 / UVボタン押下", padding=(3, 5)).pack(anchor="w")
+        preview_header = ttk.Frame(right)
+        preview_header.pack(fill="x")
+        ttk.Label(preview_header, text="プレビュー（16:9）", padding=(3, 5)).pack(side="left")
+        ttk.Checkbutton(preview_header, text="編集表示と同期",
+                        variable=self.preview_sync_visibility,
+                        command=self._on_preview_visibility_sync_change).pack(side="right", padx=(2, 4))
         self.preview_canvas = tk.Canvas(right, bg="#181d26", height=285, highlightthickness=0)
         self.preview_canvas.pack(fill="x", padx=(5, 2))
         self.preview_canvas.bind("<Configure>", lambda _: self.request_draw("preview"))
         self.preview_canvas.bind("<ButtonPress-1>", self.preview_click)
         self.preview_canvas.bind("<ButtonRelease-1>", self.preview_release)
         self.preview_canvas.bind("<B1-Motion>", self.preview_drag_held)
+        self.preview_canvas.bind("<MouseWheel>", self.preview_wheel)
+        self.preview_canvas.bind("<Shift-MouseWheel>", self.preview_wheel)
+        self.preview_canvas.bind("<Button-4>", self.preview_wheel)
+        self.preview_canvas.bind("<Button-5>", self.preview_wheel)
+        # Editor-local preview gain controls. These are never part of serialize().
+        preview_audio_row = ttk.Frame(right, padding=(5, 3))
+        preview_audio_row.pack(fill='x')
+        for kind, caption, var in (
+            ('bgm', 'BGM音量', self.preview_bgm_volume_var),
+            ('se', 'SE音量', self.preview_se_volume_var),
+        ):
+            sub = ttk.Frame(preview_audio_row)
+            sub.pack(side='left', fill='x', expand=True, padx=3)
+            ttk.Label(sub, text=caption).pack(side='left')
+            level = ttk.Scale(sub, from_=0, to=100, orient='horizontal',
+                              variable=var, length=82,
+                              command=lambda val, k=kind: self._change_preview_volume(k, val))
+            level.pack(side='left', fill='x', expand=True, padx=(4, 2))
+            ttk.Label(sub, textvariable=self.preview_volume_text[kind], width=5,
+                      anchor='e').pack(side='left')
         ttk.Separator(right).pack(fill="x", padx=5, pady=8)
         asset_header = ttk.Frame(right, padding=(5, 1))
         asset_header.pack(fill="x")
-        ttk.Label(asset_header, text="配置アセット（上ほど手前）").pack(side="left")
-        ttk.Button(asset_header, text="編集表示を切替",
-                   command=self.toggle_selected_editor_visibility).pack(side="right")
+        ttk.Label(asset_header, text="配置アセット（上ほど手前）  |  Ctrl / Shift で複数選択").pack(side="left")
+        visibility_row = ttk.Frame(right, padding=(5, 2))
+        visibility_row.pack(fill="x")
+        self.visibility_buttons: dict[str, ttk.Button] = {}
+        for key, caption, callback in (
+            ("show", "選択を一括表示", lambda: self.set_selected_editor_visibility(True)),
+            ("hide", "選択を一括非表示", lambda: self.set_selected_editor_visibility(False)),
+            ("toggle", "選択の表示を反転", self.toggle_selected_editor_visibility),
+        ):
+            button = ttk.Button(visibility_row, text=caption, command=callback, state="disabled")
+            button.pack(side="left", fill="x", expand=True, padx=2)
+            self.visibility_buttons[key] = button
+        scroll_row = ttk.Frame(right, padding=(5, 3))
+        scroll_row.pack(fill="x")
+        ttk.Button(scroll_row, text="スクロールグループを作成 / 管理…",
+                   command=self.edit_scroll_groups).pack(side="left", fill="x", expand=True)
+        ttk.Button(scroll_row, text="スクロール位置をリセット",
+                   command=self.reset_scroll_offsets).pack(side="left", padx=(6,0))
+        scroll_create_row = ttk.Frame(right, padding=(5, 1))
+        scroll_create_row.pack(fill="x")
+        self.scroll_create_button = ttk.Button(scroll_create_row, text="ドラッグでスクロール範囲を新規作成",
+                                               command=self.toggle_scroll_create_mode)
+        self.scroll_create_button.pack(side="left", fill="x", expand=True)
+        ttk.Button(scroll_create_row, text="所属アセットを別画面で配置…",
+                   command=self.open_scroll_workspace).pack(side="left", fill="x", expand=True, padx=(7,0))
         asset_panel = ttk.Frame(right)
         asset_panel.pack(fill="x", padx=5)
-        self.tree = ttk.Treeview(asset_panel, columns=("visible", "category", "source"), show="tree headings", height=7, selectmode="browse")
+        self.tree = ttk.Treeview(asset_panel, columns=("visible", "category", "source"), show="tree headings", height=5, selectmode="extended")
         self.tree.heading("#0", text="アセット名")
         self.tree.heading("visible", text="編集")
         self.tree.column("visible", width=43, stretch=False, anchor="center")
@@ -5566,6 +7488,8 @@ class SceneEditor(tk.Tk):
         scrollbar.pack(side="right", fill="y")
         self.tree.configure(yscrollcommand=scrollbar.set)
         self.tree.bind("<<TreeviewSelect>>", self.tree_select)
+        self.tree.bind("<Delete>", lambda event: self.delete_selected())
+        self.tree.bind("<Escape>", lambda event: self.select(None))
         self.tree.bind("<Double-1>", self._tree_double_click)
         self.tree.bind("<Button-3>", self._tree_context)
         self.tree.bind("<ButtonPress-1>", self._asset_row_press, add="+")
@@ -5708,7 +7632,9 @@ class SceneEditor(tk.Tk):
         """Lightweight snapshot: share immutable decoded textures and animation models."""
         return {
             "assets": [self._asset_state_copy(a) for a in self.assets],
+            "scroll_groups": copy.deepcopy(self.scroll_groups),
             "selected_uid": self.selected_uid,
+            "selected_uids": set(self.selected_uids),
             "editor_hidden_uids": set(self.editor_hidden_uids),
             "scene": self.scene_name.get(),
             "background_file": self.background_file,
@@ -5737,7 +7663,21 @@ class SceneEditor(tk.Tk):
         self.audio_player.stop()
         # Re-copy the records so future edits cannot mutate a saved snapshot.
         self.assets = [self._asset_state_copy(a) for a in state["assets"]]
+        self.scroll_groups = copy.deepcopy(state.get("scroll_groups", {}))
+        workspace=self._scroll_workspace
+        if workspace is not None and workspace.winfo_exists():
+            if workspace.name not in self.scroll_groups:
+                workspace.close()
+            else:
+                workspace._photo_cache.clear()
+                workspace._photo_pixels=0
+                workspace._refresh_members()
+        if self.selected_scroll_group_name not in self.scroll_groups:
+            self.selected_scroll_group_name = None
+        self.scroll_offsets.clear()
+        self._scroll_press = None
         self.selected_uid = state["selected_uid"]
+        self.selected_uids = set(state.get("selected_uids", {self.selected_uid} if self.selected_uid else set()))
         self.editor_hidden_uids = set(state["editor_hidden_uids"])
         self.scene_name.set(state["scene"])
         self.background_file = state["background_file"]
@@ -5752,7 +7692,7 @@ class SceneEditor(tk.Tk):
         self._reset_toggle_states()
         self._refresh_event_windows()
         self.refresh_tree()
-        self.select(self.selected_uid)
+        self.select(self.selected_uid, selection=self.selected_uids)
         if self._audio_refresh is not None:
             self._audio_refresh()
         self.request_draw("both")
@@ -5762,14 +7702,64 @@ class SceneEditor(tk.Tk):
     def _asset_by_uid(self, uid: str) -> Optional[Asset]:
         return next((item for item in self.assets if item.uid == uid), None)
 
+    def _active_scroll_groups(self, visible_uids: set[str]) -> set[str]:
+        """Groups without show events are always visible; referenced ones are ON-gated.
+
+        Several toggles may reference one viewport (logical OR).  Only active,
+        visible toggle owners can enable their group.  No asset duplication.
+        """
+        references: dict[str, set[str]] = {}
+        for owner in self.assets:
+            if owner.kind != "toggle_uv":
+                continue
+            if self.toggle_states.get(owner.uid, owner.toggle_default) != "on":
+                # An OFF owner's reference still makes the group event-controlled.
+                for event in owner.events:
+                    if event["type"] == "show_scroll_group":
+                        references.setdefault(event["group_name"], set())
+                continue
+            for event in owner.events:
+                if event["type"] == "show_scroll_group":
+                    references.setdefault(event["group_name"], set()).add(owner.uid)
+        button_gated = {e["group_name"] for owner in self.assets
+                        if owner.kind in ("button", "button_uv")
+                        for e in owner.events if e["type"] in ("show_scroll_group", "toggle_scroll_group")}
+        unconditional = set(self.scroll_groups) - set(references) - button_gated
+        enabled = set(self.scroll_groups)
+        # An event trigger can itself be in *another* gated scroll group.
+        # Iterate until a hidden trigger cannot keep a different group visible.
+        for _ in range(len(self.scroll_groups) + 1):
+            accessible = set(visible_uids)
+            for group in self.scroll_groups.values():
+                if group.name not in enabled:
+                    accessible.difference_update(group.members)
+            next_enabled = unconditional | {
+                name for name, owners in references.items()
+                if any(uid in accessible for uid in owners)
+            }
+            # Button events are latched on click; the most recent button command
+            # for this group overrides its initial toggle/button visibility.
+            next_enabled = {name for name in next_enabled
+                            if self.button_scroll_states.get(name, True)}
+            next_enabled.update(name for name, value in self.button_scroll_states.items()
+                                if value and name in self.scroll_groups)
+            if next_enabled == enabled:
+                break
+            enabled = next_enabled
+        return enabled
+
     def _preview_visible_uids(self) -> set[str]:
-        """Evaluate ON-driven show/hide without mutating the scene model."""
+        """Evaluate toggle events, optionally masking editor-hidden assets and owners."""
         lookup = {a.uid: a for a in self.assets}
         cached: dict[str, bool] = {}
+        editor_mask = self.editor_hidden_uids if self.preview_sync_visibility.get() else set()
 
         def owner_chain_active(item: Asset, visiting: frozenset[str] = frozenset()) -> bool:
             if item.uid in cached:
                 return cached[item.uid]
+            if item.uid in editor_mask:
+                cached[item.uid] = False
+                return False
             owner_id = item.event_owner_uid
             if owner_id is None:
                 cached[item.uid] = True
@@ -5798,13 +7788,112 @@ class SceneEditor(tk.Tk):
                 if item.event_owner_uid in hidden and item.uid not in hidden:
                     hidden.add(item.uid)
                     changed = True
-        return shown - hidden
+        visible = shown - hidden
+        active_scroll_groups = self._active_scroll_groups(visible)
+        for group in self.scroll_groups.values():
+            if group.name not in active_scroll_groups:
+                visible.difference_update(group.members)
+        return visible
+
+    def _editor_visible_uids(self) -> set[str]:
+        """Main editor only: scroll members live in their own spacious workspace.
+
+        View filters never mutate the scene, preview, visibility flags or JSON.
+        """
+        result = {a.uid for a in self.assets if a.uid not in self.editor_hidden_uids}
+        if self.editor_sync_preview_visibility.get():
+            result.intersection_update(self._preview_visible_uids())
+        for scroll_group in self.scroll_groups.values():
+            result.difference_update(scroll_group.members)
+        return result
+
+    def _preview_visibility_changed(self) -> None:
+        """Redraw editor too if its visible layers mirror runtime preview."""
+        if self.editor_sync_preview_visibility.get():
+            self._drag_static_cache = None
+            self.refresh_tree()
+            self.request_draw("both")
+        else:
+            self.request_draw("preview")
 
     def _close_event_windows(self) -> None:
         for window in list(self._event_windows.values()):
             if window.winfo_exists():
                 window.destroy()
         self._event_windows.clear()
+
+    def edit_button_scroll_events(self, button_uid: Optional[str] = None) -> None:
+        owner = self._asset_by_uid(button_uid or self.selected_uid or "")
+        if owner is None or owner.kind not in ("button", "button_uv"):
+            return
+        existing = self._event_windows.get(owner.uid)
+        if existing is not None and existing.winfo_exists():
+            existing.refresh_list()
+            existing.lift()
+            existing.focus_force()
+            return
+        window = ButtonScrollEventWindow(self, owner.uid)
+        self._event_windows[owner.uid] = window
+
+    def add_button_scroll_events(self, button_uid: str, kind: str,
+                                 names: Sequence[str]) -> None:
+        owner = self._asset_by_uid(button_uid)
+        if owner is None or owner.kind not in ("button", "button_uv"):
+            raise ValueError("通常ボタンが見つかりません。")
+        if kind not in ("show_scroll_group", "hide_scroll_group", "toggle_scroll_group"):
+            raise ValueError("不正なイベント操作です。")
+        names = list(names)
+        if not names or len(names) != len(set(names)):
+            raise ValueError("重複せずにグループを選択してください。")
+        if len(owner.events) + len(names) > 500:
+            raise ValueError("イベントは500件以下にしてください。")
+        existing = {e.get("group_name") for e in owner.events}
+        for name in names:
+            group = self.scroll_groups.get(name)
+            if group is None or name in existing:
+                raise ValueError(f"{name}: 対象がないか登録済みです。")
+            if owner.uid in group.members and kind != "hide_scroll_group":
+                raise ValueError(f"{name}: ボタン自身の所属グループは表示・切替できません。")
+        self._push_undo()
+        owner.events.extend({"type": kind, "group_name": name} for name in names)
+        self._refresh_event_windows()
+        self._preview_visibility_changed()
+        self.status_text.set(f"{owner.name}: スクロールグループの押下イベントを{len(names)}件追加しました。")
+
+    def remove_button_scroll_event(self, button_uid: str, index: int) -> None:
+        owner = self._asset_by_uid(button_uid)
+        if owner is None or owner.kind not in ("button", "button_uv") or not 0 <= index < len(owner.events):
+            return
+        self._push_undo()
+        owner.events.pop(index)
+        self._refresh_event_windows()
+        self._preview_visibility_changed()
+
+    def _run_button_scroll_events(self, owner: Asset) -> None:
+        """Apply only on a completed click; no undo or JSON changes."""
+        if owner.kind not in ("button", "button_uv"):
+            return
+        changed = False
+        for event in owner.events:
+            kind = event["type"]
+            if kind not in ("show_scroll_group", "hide_scroll_group", "toggle_scroll_group"):
+                continue
+            name = event["group_name"]
+            if name not in self.scroll_groups:
+                continue
+            if kind == "show_scroll_group":
+                new_value = True
+            elif kind == "hide_scroll_group":
+                new_value = False
+            else:
+                new_value = name not in self._active_scroll_groups(self._preview_visible_uids())
+            self.button_scroll_states[name] = new_value
+            if not new_value:
+                self.scroll_offsets.pop(name, None)
+            changed = True
+        if changed:
+            self.status_text.set(f"ボタン {owner.name}: スクロールグループの表示を変更しました。")
+            self._preview_visibility_changed()
 
     def edit_toggle_events(self, toggle_uid: Optional[str] = None) -> None:
         owner = self._asset_by_uid(toggle_uid or self.selected_uid or "")
@@ -5900,6 +7989,9 @@ class SceneEditor(tk.Tk):
         for uid in uids:
             if owner_depth + 1 + descendants_depth(available[uid]) > 8:
                 raise ValueError("移動後のトグルイベントが最大ネスト8階層を超えます。")
+        # Keep scroll membership when transferring an already placed asset
+        # into a toggle's show event. Its UID/full_key and world transform
+        # remain stable, so no additional JSON migration is required.
         self._push_undo()
         moved = [available[uid] for uid in uids]
         moved_set = set(uids)
@@ -5909,8 +8001,11 @@ class SceneEditor(tk.Tk):
                                if not (entry["type"] == "hide" and
                                        entry["target_uid"] in moved_set)]
         for asset in moved:
+            # Event children cannot belong to a root-level exclusive group.
+            asset.toggle_group = None
             asset.event_owner_uid = toggle_uid
             owner.events.append({"type": "show", "asset_uid": asset.uid})
+        self._repair_toggle_groups()
         # The layer order is held by self.assets; do not remove/reinsert records.
         self._drag_static_cache = None
         self._refresh_event_windows()
@@ -5935,6 +8030,35 @@ class SceneEditor(tk.Tk):
         self._refresh_event_windows()
         self.status_text.set("イベントの順序を変更しました。Ctrl+Zで元に戻せます。")
 
+    def add_scroll_group_show_events(self, toggle_uid: str,
+                                     group_names: Sequence[str]) -> None:
+        """Gate one or more existing scroll viewports behind a toggle's ON state."""
+        owner = self._asset_by_uid(toggle_uid)
+        if owner is None or owner.kind != "toggle_uv":
+            raise ValueError("対象のトグルボタンが見つかりません。")
+        names = list(group_names)
+        if not names or len(names) != len(set(names)):
+            raise ValueError("追加するグループを重複なく選択してください。")
+        existing = {e["group_name"] for e in owner.events
+                    if e["type"] == "show_scroll_group"}
+        for name in names:
+            group = self.scroll_groups.get(name)
+            if group is None:
+                raise ValueError(f"スクロールグループ '{name}' が見つかりません。")
+            if name in existing:
+                raise ValueError(f"{name} は既にイベントへ登録されています。")
+            if owner.uid in group.members:
+                raise ValueError(f"{name}: トグル自身が属するグループは制御できません。")
+        if len(owner.events) + len(names) > 500:
+            raise ValueError("トグルイベントは500件以下にしてください。")
+        self._push_undo()
+        for name in names:
+            owner.events.append({"type": "show_scroll_group", "group_name": name})
+        self._drag_static_cache = None
+        self._refresh_event_windows()
+        self._preview_visibility_changed()
+        self.status_text.set(f"スクロールグループ {len(names)} 件をON時の表示イベントへ追加しました。")
+
     def add_hide_event(self, toggle_uid: str, target_uid: str) -> None:
         owner = self._asset_by_uid(toggle_uid)
         target = self._asset_by_uid(target_uid)
@@ -5948,7 +8072,7 @@ class SceneEditor(tk.Tk):
         owner.events.append({"type": "hide", "target_uid": target_uid})
         self._drag_static_cache = None
         self._refresh_event_windows()
-        self.request_draw("preview")
+        self._preview_visibility_changed()
 
     def restore_toggle_event_asset(self, owner_uid: str, index: int) -> Asset:
         """Make a show-event asset a scene root, with one undoable operation.
@@ -6006,6 +8130,7 @@ class SceneEditor(tk.Tk):
         event = owner.events.pop(index)
         if event["type"] == "show":
             self._remove_asset_tree(event["asset_uid"])
+        self._repair_toggle_groups()
         self._drag_static_cache = None
         self._refresh_event_windows()
         self.refresh_tree()
@@ -6022,6 +8147,8 @@ class SceneEditor(tk.Tk):
                     removal.add(item.uid)
                     changed = True
         self.assets = [a for a in self.assets if a.uid not in removal]
+        for group in self.scroll_groups.values():
+            group.members.difference_update(removal)
         self.editor_hidden_uids.difference_update(removal)
         for item in self.assets:
             item.events = [dict(e) for e in item.events if
@@ -6041,11 +8168,14 @@ class SceneEditor(tk.Tk):
         return f"{original.name}_{number}"
 
     def _clone_event_descendants(self, source: Asset, target: Asset,
-                                 templates: dict[str, Asset], offset: float) -> None:
+                                 templates: dict[str, Asset], offset: float,
+                                 y_offset: Optional[float] = None) -> None:
         """Copy a toggle's event tree, remapping stable UIDs to fresh ones."""
+        if y_offset is None:
+            y_offset = -offset  # Historical paste/duplicate offset.
         target.events = []
         for old_event in source.events:
-            if old_event["type"] == "hide":
+            if old_event["type"] in ("hide", "show_scroll_group", "hide_scroll_group", "toggle_scroll_group"):
                 target.events.append(dict(old_event))
             elif old_event["type"] == "show":
                 old_child = templates.get(old_event["asset_uid"])
@@ -6056,19 +8186,21 @@ class SceneEditor(tk.Tk):
                 child = self._asset_state_copy(old_child)
                 child.uid = uuid.uuid4().hex
                 child.event_owner_uid = target.uid
+                child.toggle_group = None
                 child.name = self._unique_asset_name(child)
                 child.px += offset
-                child.py -= offset
+                child.py += y_offset
                 self.assets.append(child)
                 if child.kind == "toggle_uv":
                     self.toggle_states[child.uid] = child.toggle_default
                 target.events.append({"type": "show", "asset_uid": child.uid})
-                self._clone_event_descendants(old_child, child, templates, offset)
+                self._clone_event_descendants(old_child, child, templates, offset, y_offset)
 
     def _reset_toggle_states(self) -> None:
-        """Restore a scene's saved initial states, not the last preview clicks."""
+        """Restore saved initial states and clear preview-only button scroll commands."""
         self.toggle_states = {asset.uid: asset.toggle_default for asset in self.assets
                               if asset.kind == "toggle_uv"}
+        self.button_scroll_states.clear()
 
     def apply_toggle_default(self, _event: Any = None) -> None:
         asset = self.get_selected()
@@ -6077,11 +8209,24 @@ class SceneEditor(tk.Tk):
         new_state = self.toggle_default_var.get()
         if new_state not in ("off", "on"):
             return
+        if asset.toggle_group:
+            if new_state == "off":
+                # An exclusive group must always contain exactly one ON member.
+                self.toggle_default_var.set(asset.toggle_default)
+                return
+            members = [a for a in self.assets if a.toggle_group == asset.toggle_group]
+            if asset.toggle_default != "on":
+                self._push_undo()
+                for member in members:
+                    member.toggle_default = "on" if member.uid == asset.uid else "off"
+                    self.toggle_states[member.uid] = member.toggle_default
+                self.request_draw("both")
+            return
         if asset.toggle_default != new_state:
             self._push_undo()
             asset.toggle_default = new_state
             self.toggle_states[asset.uid] = new_state
-            self.request_draw("preview")
+            self._preview_visibility_changed()
 
     def _startup_draw(self) -> None:
         self._startup_draw_job = None
@@ -6140,11 +8285,9 @@ class SceneEditor(tk.Tk):
                     self._background_cache.clear()
                 self._background_cache[cache_key] = background
             output.alpha_composite(background)
-        shown = self._preview_visible_uids() if preview else None
+        shown = self._preview_visible_uids() if preview else self._editor_visible_uids()
         for asset in self.assets if assets_override is None else assets_override:
-            if not preview and asset.uid in self.editor_hidden_uids:
-                continue
-            if shown is not None and asset.uid not in shown:
+            if asset.uid not in shown:
                 continue
             if asset.uid == skip_uid:
                 continue
@@ -6155,7 +8298,9 @@ class SceneEditor(tk.Tk):
                 # Held visual is preview-only. Center and scale its crop independently;
                 # the regular hit region stays stable even if UV sizes differ.
                 if (asset.kind == "toggle_uv" and
-                        (self.toggle_states.get(asset.uid, asset.toggle_default) if preview else asset.toggle_default) == "on" and
+                        (self.toggle_states.get(asset.uid, asset.toggle_default)
+                         if preview or self.editor_sync_preview_visibility.get()
+                         else asset.toggle_default) == "on" and
                         asset.pressed_image is not None):
                     raster = asset.pressed_image
                     intrinsic_w, intrinsic_h = raster.size
@@ -6183,6 +8328,11 @@ class SceneEditor(tk.Tk):
                 rotated = resized.rotate(math.degrees(asset.rotation), expand=True, resample=sampler)
                 mx, my = (x0 + x1) / 2, (y0 + y1) / 2
                 wx, wy = transform_local(asset, mx, my)
+                scroll_group = self._scroll_group_of(asset.uid) if preview else None
+                if scroll_group is not None:
+                    dx,dy=self.scroll_offsets.get(scroll_group.name,(0.0,0.0))
+                    wx+=dx
+                    wy+=dy
                 sx = width / 2 + wx * scale
                 sy = height / 2 - wy * scale
                 left = round(sx - rotated.width / 2)
@@ -6190,6 +8340,13 @@ class SceneEditor(tk.Tk):
                 # Clip to viewport before compositing; avoids version-dependent Pillow bounds errors.
                 ix0, iy0 = max(0, left), max(0, top)
                 ix1, iy1 = min(width, left + rotated.width), min(height, top + rotated.height)
+                if scroll_group is not None:
+                    gx0,gy0,gx1,gy1=scroll_group.bounds
+                    # World viewport -> screen image pixels; Y is up in world space.
+                    ix0=max(ix0,math.ceil(width/2+gx0*scale))
+                    ix1=min(ix1,math.floor(width/2+gx1*scale))
+                    iy0=max(iy0,math.ceil(height/2-gy1*scale))
+                    iy1=min(iy1,math.floor(height/2-gy0*scale))
                 if ix1 > ix0 and iy1 > iy0:
                     part = rotated.crop((ix0 - left, iy0 - top, ix1 - left, iy1 - top))
                     output.alpha_composite(part, (ix0, iy0))
@@ -6217,21 +8374,24 @@ class SceneEditor(tk.Tk):
         canvas.create_image(vx, vy, image=photo, anchor="nw")
         canvas.create_rectangle(vx, vy, vx + content_w, vy + content_h, outline="#566173")
         shapes = {}
-        shown = self._preview_visible_uids() if key == "preview" else None
+        shown = self._preview_visible_uids() if key == "preview" else self._editor_visible_uids()
         for asset in self.assets:
-            if key == "edit" and asset.uid in self.editor_hidden_uids:
-                continue
-            if shown is not None and asset.uid not in shown:
+            if asset.uid not in shown:
                 continue
             polygon = self.polygon(asset, key)
+            group=self._scroll_group_of(asset.uid) if key=="preview" else None
+            if group is not None:
+                dx,dy=self.scroll_offsets.get(group.name,(0.0,0.0))
+                polygon=[(x+dx*scale,y-dy*scale) for x,y in polygon]
             shapes[asset.uid] = polygon
             if key == "edit":
-                border = SELECTION_COLOR if asset.uid == self.selected_uid else OUTLINE_COLOR
+                border = SELECTION_COLOR if asset.uid in self.selected_uids else OUTLINE_COLOR
                 canvas.create_polygon(*sum(([x, y] for x, y in polygon), []),
-                                      outline=border, fill="", width=2 if asset.uid == self.selected_uid else 1)
-                if asset.uid == self.selected_uid:
+                                      outline=border, fill="", width=2 if asset.uid in self.selected_uids else 1)
+                if asset.uid == self.selected_uid and len(self.selected_uids) == 1:
                     self._draw_handles(canvas, asset, key)
         if key == "edit":
+            self._draw_scroll_group_overlays()
             self.editor_shapes = shapes
         else:
             self.preview_shapes = shapes
@@ -6266,26 +8426,51 @@ class SceneEditor(tk.Tk):
                                         outline="#253245", fill=SELECTION_COLOR, tags=tags)
 
     def refresh_tree(self) -> None:
-        previous = self.selected_uid
+        previous = set(self.selected_uids)
         scroll = self.tree.yview()
-        for child in self.tree.get_children():
-            self.tree.delete(child)
-        for a in reversed(self.assets):
-            owner = self._asset_by_uid(a.event_owner_uid) if a.event_owner_uid else None
-            label = f"↳ {a.name} [追加表示: {owner.name if owner else '不明'}]" if owner else a.name
-            hidden = a.uid in self.editor_hidden_uids
-            self.tree.insert("", "end", iid=a.uid, text=label,
-                             values=("非表示" if hidden else "表示", "動作" if a.category == "animation" else "UI", a.source.name),
-                             tags=("hidden",) if hidden else ())
-        self.tree.tag_configure("hidden", foreground="#8c939e")
-        if previous and self.tree.exists(previous):
-            self.tree.selection_set(previous)
+        self._syncing_tree_selection = True
+        try:
+            for child in self.tree.get_children():
+                self.tree.delete(child)
+            preview_shown = (self._preview_visible_uids()
+                             if self.editor_sync_preview_visibility.get() else None)
+            for a in reversed(self.assets):
+                owner = self._asset_by_uid(a.event_owner_uid) if a.event_owner_uid else None
+                label = f"↳ {a.name} [追加表示: {owner.name if owner else '不明'}]" if owner else a.name
+                if a.toggle_group:
+                    label += f" [排他: {a.toggle_group}]"
+                scroll_group=self._scroll_group_of(a.uid)
+                if scroll_group is not None:
+                    label += f" [スクロール: {scroll_group.name}]"
+                manual_hidden = a.uid in self.editor_hidden_uids
+                preview_hidden = preview_shown is not None and a.uid not in preview_shown
+                status = ("非表示（手動+プレビュー）" if manual_hidden and preview_hidden else
+                          "非表示" if manual_hidden else
+                          "非表示（プレビュー）" if preview_hidden else "表示")
+                self.tree.insert("", "end", iid=a.uid, text=label,
+                                 values=(status, "動作" if a.category == "animation" else "UI", a.source.name),
+                                 tags=("hidden",) if manual_hidden or preview_hidden else ())
+            self.tree.tag_configure("hidden", foreground="#8c939e")
+            retained = [uid for uid in previous if self.tree.exists(uid)]
+            if retained:
+                self.tree.selection_set(retained)
+        finally:
+            self._syncing_tree_selection = False
         if scroll:
             self.tree.yview_moveto(scroll[0])
         self._update_layer_buttons()
 
     def _update_layer_buttons(self) -> None:
-        """Disable commands that cannot change the current stacking order."""
+        """Disable unavailable layer and visibility operations."""
+        if hasattr(self, "visibility_buttons"):
+            selection = self.selected_uids
+            any_visible = any(a.uid in selection and a.uid not in self.editor_hidden_uids
+                              for a in self.assets)
+            any_hidden = any(a.uid in selection and a.uid in self.editor_hidden_uids
+                             for a in self.assets)
+            for key, active in (("show", any_hidden), ("hide", any_visible),
+                                ("toggle", bool(selection))):
+                self.visibility_buttons[key].configure(state="normal" if active else "disabled")
         if not hasattr(self, "layer_buttons"):
             return
         ordered = list(reversed(self.assets))
@@ -6346,6 +8531,8 @@ class SceneEditor(tk.Tk):
         """Record a candidate row; click and double-click remain ordinary selection."""
         self._asset_row_drag_source = None
         self._asset_row_drag_changed = False
+        if event.state & (0x1 | 0x4) or len(self.selected_uids) > 1:
+            return  # Preserve Ctrl/Shift multi-selection instead of reordering rows.
         if self.tree.identify_region(event.x, event.y) not in ("cell", "tree"):
             return
         uid = self.tree.identify_row(event.y)
@@ -6396,25 +8583,64 @@ class SceneEditor(tk.Tk):
             self.tree.selection_set(source)
             self.tree.see(source)
 
-    def set_editor_asset_visibility(self, uid: str, visible: bool) -> None:
-        """Editor-layer only: the scene's runtime and serialized state never change."""
-        asset = self._asset_by_uid(uid)
-        if asset is None or (uid not in self.editor_hidden_uids) == visible:
-            return
-        self._push_undo()
-        if visible:
-            self.editor_hidden_uids.discard(uid)
+    def _on_preview_visibility_sync_change(self) -> None:
+        """Editor manual visibility -> preview (existing v39 option)."""
+        self.pressed_button_uid = None
+        self._button_pointer_inside = False
+        self._preview_visibility_changed()
+        if self.preview_sync_visibility.get():
+            self.status_text.set("編集→プレビュー同期ON: 手動で隠したアセットをプレビューでも非表示にします。")
         else:
-            self.editor_hidden_uids.add(uid)
+            self.status_text.set("編集→プレビュー同期OFF: プレビューは編集画面の手動非表示を参照しません。")
+
+    def _on_editor_visibility_sync_change(self) -> None:
+        """Preview toggle/event visibility -> editor, retaining manual hidden preferences."""
         self._drag_static_cache = None
         self.refresh_tree()
         self.request_draw("edit")
-        self.status_text.set(f"{asset.name}: 編集画面で{'表示' if visible else '非表示'}（プレビューに影響なし）")
+        if self.editor_sync_preview_visibility.get():
+            self.status_text.set("プレビュー→編集同期ON: トグルイベントの表示状態を編集画面にも反映します（手動非表示は維持）。")
+        else:
+            self.status_text.set("プレビュー→編集同期OFF: 従来の編集画面表示に戻しました。")
+
+    def set_editor_asset_visibility(self, uid: str, visible: bool) -> None:
+        """Single-target convenience function backed by undoable batch visibility."""
+        self._change_editor_visibility({uid}, visible=visible)
+
+    def _change_editor_visibility(self, uids: set[str], *, visible: Optional[bool]) -> None:
+        """Apply one undo record for an arbitrary selection of assets.
+
+        visible=None means invert the current visibility independently for each UID.
+        """
+        existing = {a.uid for a in self.assets}
+        targets = uids & existing
+        if not targets:
+            return
+        before = set(self.editor_hidden_uids)
+        if visible is True:
+            updated = before - targets
+        elif visible is False:
+            updated = before | targets
+        else:
+            updated = before ^ targets
+        if before == updated:
+            return
+        self._push_undo()
+        self.editor_hidden_uids = updated
+        self._drag_static_cache = None
+        self.refresh_tree()
+        self.request_draw("both" if self.preview_sync_visibility.get() else "edit")
+        changed = len((before ^ updated) & targets)
+        label = "表示" if visible is True else "非表示" if visible is False else "表示/非表示を反転"
+        self.status_text.set(f"{changed}件のアセットの編集表示を{label}しました（Ctrl+Zで取り消し可能）。")
+
+    def set_selected_editor_visibility(self, visible: bool) -> None:
+        """Show or hide all currently selected assets in a single operation."""
+        self._change_editor_visibility(set(self.selected_uids), visible=visible)
 
     def toggle_selected_editor_visibility(self) -> None:
-        asset = self.get_selected()
-        if asset is not None:
-            self.set_editor_asset_visibility(asset.uid, asset.uid in self.editor_hidden_uids)
+        """Invert each selected asset's visibility (mixed selections supported)."""
+        self._change_editor_visibility(set(self.selected_uids), visible=None)
 
     def _tree_double_click(self, event: tk.Event) -> Optional[str]:
         uid = self.tree.identify_row(event.y)
@@ -6427,8 +8653,34 @@ class SceneEditor(tk.Tk):
         uid = self.tree.identify_row(event.y)
         if not uid:
             return
-        self.select(uid)
+        # Keep an existing multi-selection intact when opening its context menu.
+        if uid in self.selected_uids:
+            self.select(uid, selection=set(self.selected_uids))
+        else:
+            self.select(uid)
+        asset = self._asset_by_uid(uid)
+        if asset is None:
+            return
         menu = tk.Menu(self, tearoff=False)
+        if len(self.selected_uids) > 1:
+            menu.add_command(label=f"選択した{len(self.selected_uids)}件を一括表示",
+                             command=lambda: self.set_selected_editor_visibility(True))
+            menu.add_command(label=f"選択した{len(self.selected_uids)}件を一括非表示",
+                             command=lambda: self.set_selected_editor_visibility(False))
+            menu.add_command(label="選択したアセットの表示を反転",
+                             command=self.toggle_selected_editor_visibility)
+            menu.add_separator()
+        if asset.kind == "toggle_uv" and asset.toggle_group:
+            menu.add_command(label="複数トグルスイッチのグループを編集",
+                command=lambda group=asset.toggle_group: self.edit_exclusive_toggle_group(group))
+            menu.add_separator()
+        if asset.kind in ("button", "button_uv"):
+            menu.add_command(label="押下時のスクロールイベント…",
+                             command=lambda: self.edit_button_scroll_events(uid))
+            menu.add_separator()
+        elif asset.kind == "toggle_uv":
+            menu.add_command(label="イベントの追加", command=lambda: self.edit_toggle_events(uid))
+            menu.add_separator()
         hidden = uid in self.editor_hidden_uids
         asset = self._asset_by_uid(uid)
         if asset is not None:
@@ -6450,11 +8702,22 @@ class SceneEditor(tk.Tk):
             menu.grab_release()
 
     def tree_select(self, _event: Any = None) -> None:
-        selected = self.tree.selection()
-        if selected and self.selected_uid != selected[0]:
-            self.select(selected[0])
+        if self._syncing_tree_selection:
+            return
+        selected = set(self.tree.selection())
+        if selected != self.selected_uids:
+            primary = self.tree.focus()
+            if primary not in selected:
+                primary = self.selected_uid if self.selected_uid in selected else next(iter(selected), None)
+            self.select(primary, selection=selected)
 
-    def select(self, uid: Optional[str]) -> None:
+    def select(self, uid: Optional[str], *, selection: Optional[set[str]] = None) -> None:
+        """Keep canvas selection, Treeview, and single-asset inspector consistent."""
+        valid_uids = {item.uid for item in self.assets}
+        chosen = (set(selection) if selection is not None else ({uid} if uid else set())) & valid_uids
+        if uid not in chosen:
+            uid = next((a.uid for a in reversed(self.assets) if a.uid in chosen), None)
+        self.selected_uids = chosen
         self.selected_uid = uid
         asset = self.get_selected()
         self._property_updating = True
@@ -6485,11 +8748,16 @@ class SceneEditor(tk.Tk):
         finally:
             self._property_updating = False
         self._update_layer_buttons()
-        if uid and self.tree.exists(uid):
-            self.tree.selection_set(uid)
-            self.tree.see(uid)
-        else:
-            self.tree.selection_remove(self.tree.selection())
+        self._syncing_tree_selection = True
+        try:
+            self.tree.selection_set([item for item in self.selected_uids if self.tree.exists(item)])
+            if uid and self.tree.exists(uid):
+                self.tree.focus(uid)
+                self.tree.see(uid)
+        finally:
+            self._syncing_tree_selection = False
+        if len(self.selected_uids) > 1:
+            self.status_text.set(f"{len(self.selected_uids)} 個のアセットを選択中（一括移動・表示切替・削除が可能）")
         self.request_draw("edit")
 
     def _refresh_animation_se_choices(self, asset: Optional[Asset] = None) -> None:
@@ -6523,6 +8791,15 @@ class SceneEditor(tk.Tk):
         if getattr(asset, field_name) != next_se:
             self._push_undo()
             setattr(asset, field_name, next_se)
+
+    def _change_preview_volume(self, kind: str, value: str) -> None:
+        """Only preview mixer state changes. No undo or scene serialization."""
+        try:
+            volume = max(0, min(100, round(float(value))))
+        except (ValueError, TypeError):
+            return
+        self.preview_volume_text[kind].set(f"{volume}%")
+        self.audio_player.set_volume(kind, volume)
 
     def play_primary_bgm(self) -> None:
         collection = self.audio["bgm"]
@@ -6668,11 +8945,40 @@ class SceneEditor(tk.Tk):
         """Show commands for the asset *under the pointer*, not a stale selection."""
         self.edit_canvas.focus_set()
         self._pending_spawn = self.screen_to_world("edit", event.x, event.y)
-        target = self._hit_asset("edit", event.x, event.y)
+        target = self._hit_asset("edit", event.x, event.y) if self.selection_mode.get() == "asset" else None
+        group_hit = self._scroll_group_hit(event.x, event.y, True) if self.selection_mode.get() == "scroll" else None
+        if group_hit is not None and not self._scroll_create_mode:
+            self.selected_scroll_group_name = group_hit[0]
+            self._draw_scroll_group_overlays()
+            menu = tk.Menu(self, tearoff=False)
+            menu.add_command(label=f"スクロール範囲: {group_hit[0]}", state="disabled")
+            menu.add_command(label="表示範囲・所属を編集…",
+                             command=lambda name=group_hit[0]: self.edit_scroll_groups(name))
+            menu.add_command(label="所属アセットを別画面で配置…",
+                             command=lambda name=group_hit[0]: self.open_scroll_workspace(name))
+            menu.add_command(label="ドラッグで新しい範囲を作成", command=self.enable_scroll_create_mode)
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
+            return
         menu = tk.Menu(self, tearoff=False)
         if target is not None:
-            if target.uid != self.selected_uid:
+            if target.uid in self.selected_uids:
+                self.select(target.uid, selection=set(self.selected_uids))
+            else:
                 self.select(target.uid)
+            if len(self.selected_uids) > 1:
+                menu.add_command(label=f"選択した{len(self.selected_uids)}件を一括表示",
+                                 command=lambda: self.set_selected_editor_visibility(True))
+                menu.add_command(label=f"選択した{len(self.selected_uids)}件を一括非表示",
+                                 command=lambda: self.set_selected_editor_visibility(False))
+                menu.add_command(label="選択したアセットの表示を反転",
+                                 command=self.toggle_selected_editor_visibility)
+                menu.add_separator()
+            sg=self._scroll_group_of(target.uid)
+            menu.add_command(label=("スクロールグループを編集" if sg else "スクロールグループに所属…"),
+                             command=lambda g=sg: self.edit_scroll_groups(g.name if g else None))
             if target.kind == "window":
                 menu.add_command(label="ウィンドウ設定を編集", command=self.edit_selected_window)
             if target.kind == "image":
@@ -6690,9 +8996,15 @@ class SceneEditor(tk.Tk):
             elif target.kind == "toggle_uv":
                 menu.add_command(label="ボタンへ変更",
                                  command=lambda uid=target.uid: self.convert_button_toggle(uid, False))
+            if target.kind == "toggle_uv" and target.toggle_group:
+                menu.add_command(label="複数トグルスイッチのグループを編集",
+                                 command=lambda g=target.toggle_group: self.edit_exclusive_toggle_group(g))
             if target.kind == "toggle_uv":
                 menu.add_command(label="イベントの追加",
                                  command=lambda uid=target.uid: self.edit_toggle_events(uid))
+            elif target.kind in ("button", "button_uv"):
+                menu.add_command(label="押下時のスクロールイベント…",
+                                 command=lambda uid=target.uid: self.edit_button_scroll_events(uid))
             if target.kind in ("image", "button_uv", "toggle_uv") and target.source.suffix.casefold() in (".png", ".jpg", ".jpeg"):
                 menu.add_command(label="UV範囲を編集", command=self.edit_selected_uv)
             if target.kind in ("button_uv", "button", "toggle_uv"):
@@ -6717,6 +9029,10 @@ class SceneEditor(tk.Tk):
             menu.add_command(label="複製", command=self.duplicate_selected)
             menu.add_command(label="削除", command=self.delete_selected)
         else:
+            menu.add_command(label="スクロールグループを作成 / 管理…", command=self.edit_scroll_groups)
+            menu.add_separator()
+            menu.add_command(label="複数トグルスイッチを配置（2個以上・排他）",
+                             command=lambda: self.edit_exclusive_toggle_group())
             menu.add_command(label="ウィンドウの追加（9スライス / PNG / JPG）", command=lambda: self.add_asset("window"))
             menu.add_command(label="画像を配置（PNG / JPG / plist）", command=lambda: self.add_asset("image"))
             menu.add_command(label="画像をUVで配置（PNG / JPG）", command=lambda: self.add_asset("image_uv"))
@@ -6796,6 +9112,15 @@ class SceneEditor(tk.Tk):
                 return
         elif asset.kind != "toggle_uv":
             return
+        if to_toggle and any(e["type"] in ("hide_scroll_group", "toggle_scroll_group")
+                             for e in asset.events):
+            accepted = messagebox.askyesno(
+                APP_NAME,
+                "トグルボタンには『非表示』『表示／非表示の切替』イベントがありません。\n"
+                "変換するとこれらのイベントは削除されます。続行しますか？",
+                parent=self)
+            if not accepted:
+                return
         if not to_toggle and asset.events:
             accepted = messagebox.askyesno(
                 APP_NAME,
@@ -6830,7 +9155,7 @@ class SceneEditor(tk.Tk):
                     asset.pressed_key = None
                 asset.kind = "toggle_uv"
                 asset.toggle_default = "off"
-                asset.events = []
+                asset.events = [dict(e) for e in asset.events if e["type"] == "show_scroll_group"]
                 self.toggle_states[asset.uid] = "off"
             else:
                 # Children must disappear together with the event that owns them.
@@ -6839,6 +9164,7 @@ class SceneEditor(tk.Tk):
                         self._remove_asset_tree(toggle_event["asset_uid"])
                 asset.events.clear()
                 asset.kind = "button_uv"
+                asset.toggle_group = None
                 asset.toggle_default = "off"
                 self.toggle_states.pop(asset.uid, None)
             load_visual(asset)
@@ -6853,6 +9179,7 @@ class SceneEditor(tk.Tk):
                 self.undo()
             messagebox.showerror(APP_NAME, f"ボタン種別の変更に失敗しました:\n{exc}", parent=self)
             return
+        self._repair_toggle_groups()
         self._drag_static_cache = None
         self._refresh_event_windows()
         self.refresh_tree()
@@ -6868,13 +9195,13 @@ class SceneEditor(tk.Tk):
         original_kind = asset.kind
         if state not in ("normal", "pressed"):
             raise ValueError("変換する画像の状態が不正です。")
-        if original_kind == "toggle_uv" and asset.events:
+        if asset.events:
             if not messagebox.askyesno(APP_NAME,
-                    "画像へ変更すると、このトグルのイベントと追加表示アセットも削除されます。\n続行しますか？",
+                    "画像へ変更すると、ボタンのイベントも削除されます。\n続行しますか？",
                     parent=self):
                 return
         self._push_undo()
-        if original_kind == "toggle_uv" and asset.events:
+        if asset.events:
             for event in list(asset.events):
                 if event["type"] == "show":
                     self._remove_asset_tree(event["asset_uid"])
@@ -6896,6 +9223,8 @@ class SceneEditor(tk.Tk):
                 asset.key = asset.pressed_key or asset.key
             asset.pressed_key = None
         asset.kind = "image"
+        asset.toggle_group = None
+        self._repair_toggle_groups()
         self.toggle_states.pop(asset.uid, None)
         asset.toggle_default = "off"
         asset.button_se = None
@@ -6910,6 +9239,87 @@ class SceneEditor(tk.Tk):
         self.request_draw("both")
         label = ("OFF" if state == "normal" else "ON") if original_kind == "toggle_uv" else ("押下前" if state == "normal" else "押下中")
         self.status_text.set(f"画像へ変更 ({label}): {asset.name}")
+
+    def _repair_toggle_groups(self) -> None:
+        """Preserve a single ON switch after deleting or converting group members."""
+        groups: dict[str, list[Asset]] = {}
+        for a in self.assets:
+            if a.toggle_group and (a.kind != "toggle_uv" or a.event_owner_uid is not None):
+                a.toggle_group = None
+            if a.toggle_group:
+                groups.setdefault(a.toggle_group, []).append(a)
+        for members in groups.values():
+            if len(members) < 2:
+                members[0].toggle_group = None
+                continue
+            active = next((a for a in members if a.toggle_default == "on"), members[0])
+            preview_active = next((a for a in members if self.toggle_states.get(a.uid) == "on"), active)
+            for a in members:
+                a.toggle_default = "on" if a.uid == active.uid else "off"
+                self.toggle_states[a.uid] = "on" if a.uid == preview_active.uid else "off"
+
+    def edit_exclusive_toggle_group(self, group: Optional[str] = None) -> None:
+        dialog = ExclusiveToggleGroupDialog(self, group)
+        if dialog.result is None:
+            return
+        name, members, previous_uids, initial_index, duplicate_sources = dialog.result
+        self._push_undo()
+        member_uids = {a.uid for a in members}
+        # Excluded existing switches become standalone toggles, never deleted.
+        for asset in self.assets:
+            if asset.toggle_group == group and group is not None:
+                asset.toggle_group = None
+        cumulative_width = sum(max(1.0, m.bounds[2] - m.bounds[0]) for m in members)
+        gap = 24.0
+        span = cumulative_width + gap * (len(members) - 1)
+        cursor = self._pending_spawn[0] - span / 2
+        for index, updated in enumerate(members):
+            updated.toggle_group = name
+            updated.toggle_default = "on" if index == initial_index else "off"
+            actual = self._asset_by_uid(updated.uid)
+            if actual is None:
+                # New switches are laid out side-by-side at placement position.
+                # Record the source transform before changing its position, so
+                # cloned event children retain their relative arrangement.
+                source_uid = duplicate_sources.get(updated.uid)
+                source_asset = self._asset_by_uid(source_uid) if source_uid else None
+                previous_px = source_asset.px if source_asset is not None else updated.px - 32.0
+                previous_py = source_asset.py if source_asset is not None else updated.py + 32.0
+                # For a duplicate of another newly added row, use that row's
+                # committed descendants rather than stale references copied
+                # while the dialog was open.
+                source_events = source_asset if source_asset is not None else updated
+                event_template = (self._asset_state_copy(source_events)
+                                  if source_events.events else None)
+                updated.px = cursor + (updated.bounds[2] - updated.bounds[0]) / 2
+                updated.py = self._pending_spawn[1]
+                self.assets.append(updated)
+                if event_template is not None:
+                    templates = {a.uid: a for a in self.assets}
+                    self._clone_event_descendants(event_template, updated, templates,
+                                                  updated.px - previous_px,
+                                                  updated.py - previous_py)
+            else:
+                # Keep stable UID, transform, flags and event ownership, and replace visuals.
+                actual.name = updated.name
+                actual.source = updated.source
+                actual.pressed_source = updated.pressed_source
+                actual.uv_rect = updated.uv_rect
+                actual.pressed_uv_rect = updated.pressed_uv_rect
+                actual.button_se = updated.button_se
+                actual.toggle_default = updated.toggle_default
+                actual.toggle_group = name
+                load_visual(actual)
+            cursor += max(1.0, updated.bounds[2] - updated.bounds[0]) + gap
+        for a in self.assets:
+            if a.toggle_group == name:
+                self.toggle_states[a.uid] = a.toggle_default
+        self._repair_toggle_groups()
+        self._drag_static_cache = None
+        self.refresh_tree()
+        self.select(members[initial_index].uid)
+        self.request_draw("both")
+        self.status_text.set(f"排他トグルグループ {name}: {len(members)} 個 / 初期ON={members[initial_index].name}")
 
     def add_asset(self, kind: str, event_owner_uid: Optional[str] = None) -> Optional[Asset]:
         if len(self.assets) >= MAX_ASSETS:
@@ -7166,12 +9576,16 @@ class SceneEditor(tk.Tk):
 
     def _hit_asset(self, key: str, x: float, y: float) -> Optional[Asset]:
         polygons = self.editor_shapes if key == "edit" else self.preview_shapes
-        shown = self._preview_visible_uids() if key == "preview" else None
+        shown = self._preview_visible_uids() if key == "preview" else self._editor_visible_uids()
         for asset in reversed(self.assets):
-            if key == "edit" and asset.uid in self.editor_hidden_uids:
+            if asset.uid not in shown:
                 continue
-            if shown is not None and asset.uid not in shown:
-                continue
+            group=self._scroll_group_of(asset.uid) if key=="preview" else None
+            if group is not None:
+                gx0,gy0,gx1,gy1=group.bounds
+                wx,wy=self.screen_to_world("preview",x,y)
+                if not (gx0<=wx<=gx1 and gy0<=wy<=gy1):
+                    continue
             if inside_polygon(x, y, polygons.get(asset.uid, [])) if polygons.get(asset.uid) else False:
                 return asset
         return None
@@ -7191,11 +9605,12 @@ class SceneEditor(tk.Tk):
             selected_index = self.assets.index(asset)
             below = self.assets[:selected_index]
             above = self.assets[selected_index + 1:]
+            editor_shown = self._editor_visible_uids()
             signature = (asset.uid, selected_index, width, height,
                 id(self.background_image),
                 tuple((other.uid, other.px, other.py, other.sx, other.sy,
                        other.rotation, other.flip_x, other.flip_y,
-                       other.toggle_default, other.uid in self.editor_hidden_uids,
+                       other.toggle_default, other.uid not in editor_shown,
                        id(other.image), id(other.model))
                       for other in self.assets if other.uid != asset.uid))
             if self._drag_static_cache is not None and self._drag_static_cache[0] == signature:
@@ -7217,7 +9632,7 @@ class SceneEditor(tk.Tk):
             canvas.create_rectangle(vx, vy, vx + content_w, vy + content_h,
                                     outline="#566173")
             for other in self.assets:
-                if other.uid != asset.uid and other.uid not in self.editor_hidden_uids:
+                if other.uid != asset.uid and other.uid in editor_shown:
                     polygon = self.polygon(other, "edit")
                     canvas.create_polygon(*[n for xy in polygon for n in xy],
                                           outline=OUTLINE_COLOR, fill="", width=1)
@@ -7239,7 +9654,10 @@ class SceneEditor(tk.Tk):
     def _drag_bitmap(self, asset: Asset) -> ImageTk.PhotoImage:
         scale = self.viewports["edit"][4]
         raster, _density = asset_bitmap(asset, 0, scale)
-        if asset.kind == "toggle_uv" and asset.toggle_default == "on" and asset.pressed_image is not None:
+        if (asset.kind == "toggle_uv" and
+                (self.toggle_states.get(asset.uid, asset.toggle_default)
+                 if self.editor_sync_preview_visibility.get() else asset.toggle_default) == "on"
+                and asset.pressed_image is not None):
             raster = asset.pressed_image
             intrinsic_w, intrinsic_h = raster.size
         else:
@@ -7307,7 +9725,9 @@ class SceneEditor(tk.Tk):
         """Show matched distances only while moving, without repainting textures."""
         canvas = self.edit_canvas
         canvas.delete("spacing_guide")
-        if not self._drag_visual_ready or not self.spacing_snap_enabled.get():
+        scrolling = (self._drag is not None and self._drag.get("mode") in
+                     ("scroll_move", "scroll_resize", "scroll_create"))
+        if not (self._drag_visual_ready or scrolling) or not self.spacing_snap_enabled.get():
             return
         for guide in guides:
             for start, end in guide.intervals:
@@ -7343,7 +9763,9 @@ class SceneEditor(tk.Tk):
         """Lightweight, non-interactive reference lines on the editor only."""
         canvas = self.edit_canvas
         canvas.delete("snap_guide")
-        if not self._drag_visual_ready or not self.snap_enabled.get():
+        scrolling = (self._drag is not None and self._drag.get("mode") in
+                     ("scroll_move", "scroll_resize", "scroll_create"))
+        if not (self._drag_visual_ready or scrolling) or not self.snap_enabled.get():
             return
         vx, vy, vw, vh, _scale = self.viewports["edit"]
         if guide_x is not None:
@@ -7446,12 +9868,219 @@ class SceneEditor(tk.Tk):
         self._drag_upper_photo = None
         self._drag_asset_photo = None
         self._drag_asset_item = None
+        self._group_drag_photos = []
+        self._group_drag_items = {}
+
+    def _begin_group_drag_visual(self, members: list[Asset]) -> None:
+        """Render stationary layers once; keep every movable sprite as a Tk item.
+
+        Static segments are interleaved with the selected sprites in the original
+        layer order, so overlapping sprites keep their normal foreground order.
+        """
+        self._clear_drag_visual()
+        viewport = self.viewport(self.edit_canvas)
+        self.viewports["edit"] = viewport
+        vx, vy, content_w, content_h, scale = viewport
+        width, height = max(1, round(content_w)), max(1, round(content_h))
+        canvas = self.edit_canvas
+        canvas.delete("all")
+        selected = {asset.uid for asset in members}
+        pending: list[Asset] = []
+        first_segment = True
+        try:
+            def flush_static() -> None:
+                nonlocal pending, first_segment
+                if not pending and not first_segment:
+                    return
+                image = self.render_composite(width, height, scale, False,
+                    assets_override=pending, transparent=not first_segment)
+                photo = ImageTk.PhotoImage(image)
+                self._group_drag_photos.append(photo)
+                canvas.create_image(vx, vy, anchor="nw", image=photo)
+                first_segment = False
+                pending = []
+
+            for asset in self.assets:
+                if asset.uid not in selected:
+                    pending.append(asset)
+                    continue
+                flush_static()
+                photo = self._drag_bitmap(asset)
+                self._group_drag_photos.append(photo)
+                x0, y0, x1, y1 = asset.bounds
+                wx, wy = transform_local(asset, (x0 + x1)/2, (y0 + y1)/2)
+                cx, cy = self.world_to_screen("edit", wx, wy)
+                self._group_drag_items[asset.uid] = canvas.create_image(
+                    cx, cy, image=photo, anchor="center")
+            flush_static()
+            canvas.create_rectangle(vx, vy, vx+content_w, vy+content_h, outline="#566173")
+            editor_shown = self._editor_visible_uids()
+            for asset in self.assets:
+                if asset.uid not in editor_shown:
+                    continue
+                polygon = self.polygon(asset, "edit")
+                self.editor_shapes[asset.uid] = polygon
+                canvas.create_polygon(*[n for xy in polygon for n in xy],
+                    outline=SELECTION_COLOR if asset.uid in selected else OUTLINE_COLOR,
+                    fill="", width=2 if asset.uid in selected else 1,
+                    tags="active_outline" if asset.uid in selected else "")
+            self._drag_visual_ready = True
+        except (OSError, ValueError, MemoryError, tk.TclError) as exc:
+            self._drag_visual_ready = False
+            self.status_text.set(f"複数アセットの移動表示に失敗しました: {exc}")
+
+    def _update_group_drag_visual(self, members: list[Asset]) -> None:
+        if not self._drag_visual_ready:
+            return
+        canvas = self.edit_canvas
+        for asset in members:
+            item = self._group_drag_items.get(asset.uid)
+            if item is None:
+                continue
+            x0, y0, x1, y1 = asset.bounds
+            wx, wy = transform_local(asset, (x0 + x1)/2, (y0 + y1)/2)
+            canvas.coords(item, *self.world_to_screen("edit", wx, wy))
+        canvas.delete("active_outline")
+        for asset in members:
+            polygon = self.polygon(asset, "edit")
+            self.editor_shapes[asset.uid] = polygon
+            canvas.create_polygon(*[n for xy in polygon for n in xy],
+                outline=SELECTION_COLOR, fill="", width=2, tags="active_outline")
+
+    def _begin_marquee(self, event: tk.Event, add: bool) -> None:
+        """An empty-space drag selects assets intersecting its screen rectangle."""
+        base = set(self.selected_uids) if add else set()
+        if not add:
+            self.select(None)
+        self._drag = {"mode": "marquee", "start_screen": (event.x, event.y),
+                      "end_screen": (event.x, event.y), "base": base}
+        self.edit_canvas.delete("marquee")
+        self.edit_canvas.create_rectangle(event.x, event.y, event.x, event.y,
+            outline="#5fe2fa", width=2, dash=(4, 3), tags="marquee")
+
+    def _finish_marquee(self, drag: dict[str, Any]) -> None:
+        ax, ay = drag["start_screen"]
+        bx, by = drag["end_screen"]
+        left, right = sorted((ax, bx))
+        top, bottom = sorted((ay, by))
+        chosen = set(drag["base"])
+        # A click on empty space clears selection; do not select by a zero-size box.
+        if abs(ax - bx) >= 3 or abs(ay - by) >= 3:
+            editor_shown = self._editor_visible_uids()
+            for asset in self.assets:
+                if asset.uid not in editor_shown:
+                    continue
+                vertices = self.editor_shapes.get(asset.uid) or self.polygon(asset, "edit")
+                if not vertices:
+                    continue
+                xs = [vertex[0] for vertex in vertices]
+                ys = [vertex[1] for vertex in vertices]
+                if max(xs) >= left and min(xs) <= right and max(ys) >= top and min(ys) <= bottom:
+                    chosen.add(asset.uid)
+        self.edit_canvas.delete("marquee")
+        primary = next((a.uid for a in reversed(self.assets) if a.uid in chosen), None)
+        self.select(primary, selection=chosen)
+
+    def _begin_group_move(self, event: tk.Event, assets: list[Asset]) -> None:
+        point = self.screen_to_world("edit", event.x, event.y)
+        origins = {a.uid: (a.px, a.py) for a in assets}
+        editor_shown = self._editor_visible_uids()
+        others = [a for a in self.assets if a.uid not in origins
+                  and a.uid in editor_shown]
+        boxes = [asset_world_aabb(a) for a in assets]
+        initial_box = (min(b[0] for b in boxes), min(b[1] for b in boxes),
+                       max(b[2] for b in boxes), max(b[3] for b in boxes))
+        snap_x, snap_y = snap_reference_lines(others, "")
+        self._drag = {"mode": "group_move", "members": assets,
+            "origins": origins, "start": point, "before": self._snapshot(),
+            "initial_box": initial_box, "snap_x": snap_x, "snap_y": snap_y,
+            "spacing_boxes": tuple(asset_world_aabb(a) for a in others)}
+        self._begin_group_drag_visual(assets)
+
+    def _move_group(self, event: tk.Event, drag: dict[str, Any]) -> None:
+        world = self.screen_to_world("edit", event.x, event.y)
+        dx = world[0] - drag["start"][0]
+        dy = world[1] - drag["start"][1]
+        x0, y0, x1, y1 = drag["initial_box"]
+        raw = (x0 + dx, y0 + dy, x1 + dx, y1 + dy)
+        threshold = SNAP_DISTANCE_PX / max(self.viewports["edit"][4], 0.001)
+        sx = sy = 0.0
+        gx = gy = None
+        gap_guides: list[EqualGapSnap] = []
+        if self.snap_enabled.get():
+            sx, gx = nearest_snap((raw[0], (raw[0]+raw[2])/2, raw[2]), drag["snap_x"], threshold)
+            sy, gy = nearest_snap((raw[1], (raw[1]+raw[3])/2, raw[3]), drag["snap_y"], threshold)
+        if self.spacing_snap_enabled.get():
+            for axis in ("x", "y"):
+                candidate = equal_gap_snap(raw, drag["spacing_boxes"], axis,
+                                            threshold, proximity=threshold * 2)
+                if candidate is None:
+                    continue
+                if axis == "x" and (gx is None or abs(candidate.delta) <= abs(sx)):
+                    sx, gx = candidate.delta, None
+                    gap_guides.append(candidate)
+                elif axis == "y" and (gy is None or abs(candidate.delta) <= abs(sy)):
+                    sy, gy = candidate.delta, None
+                    gap_guides.append(candidate)
+        for asset in drag["members"]:
+            px, py = drag["origins"][asset.uid]
+            asset.px, asset.py = px + dx + sx, py + dy + sy
+        if self.get_selected() is not None:
+            self._sync_selected_fields(self.get_selected())
+        self._update_group_drag_visual(drag["members"])
+        self._paint_snap_guides(gx, gy)
+        self._paint_spacing_guides(gap_guides)
 
     def editor_press(self, event: tk.Event) -> None:
         self.edit_canvas.focus_set()
+        if self._scroll_create_mode:
+            self._begin_scroll_rectangle(event)
+            return
+        if self.selection_mode.get() == "scroll":
+            group_hit = self._scroll_group_hit(event.x, event.y, True)
+            if group_hit is not None and not (event.state & (0x1 | 0x4)):
+                self._begin_scroll_group_drag(event, *group_hit)
+            else:
+                self.selected_scroll_group_name = None
+                self._draw_scroll_group_overlays()
+                self._drag = None
+            return
+        # Asset mode: scroll frames must never intercept an asset drag.
+        if self.selected_scroll_group_name is not None:
+            self.selected_scroll_group_name = None
+            self._draw_scroll_group_overlays()
+        # Resize/rotate handles extend beyond the sprite polygon.  Treat them
+        # as hits before starting a marquee so original PowerPoint-style
+        # handles remain available for single selection.
+        selected = self.get_selected()
+        editor_shown = self._editor_visible_uids()
+        on_handle = (selected is not None and len(self.selected_uids) == 1 and
+                     selected.uid in editor_shown and
+                     any(math.hypot(hx-event.x, hy-event.y) <= HANDLE_HIT_RADIUS
+                         for hx, hy in self._handles(selected, "edit").values()))
+        hit = selected if on_handle else self._hit_asset("edit", event.x, event.y)
+        if hit is None:
+            self._begin_marquee(event, bool(event.state & 0x1))
+            return
+        if event.state & (0x1 | 0x4):
+            # Shift adds, Ctrl toggles an asset without dragging it.
+            choice = set(self.selected_uids)
+            if event.state & 0x4 and hit.uid in choice:
+                choice.remove(hit.uid)
+            else:
+                choice.add(hit.uid)
+            self.select(hit.uid if hit.uid in choice else None, selection=choice)
+            self._drag = None
+            return
+        if hit.uid in self.selected_uids and len(self.selected_uids) > 1:
+            members = [a for a in self.assets if a.uid in self.selected_uids
+                       and a.uid in editor_shown]
+            if len(members) > 1:
+                self._begin_group_move(event, members)
+                return
         asset = self.get_selected()
         handle = None
-        if asset and asset.uid not in self.editor_hidden_uids:
+        if asset and asset.uid in editor_shown:
             for label, (x, y) in self._handles(asset, "edit").items():
                 if math.hypot(x - event.x, y - event.y) <= HANDLE_HIT_RADIUS:
                     handle = label
@@ -7483,7 +10112,7 @@ class SceneEditor(tk.Tk):
             drag["opposite_world"] = transform_local(asset, ox, oy)
         drag["before"] = self._snapshot()
         visible_others = [other for other in self.assets
-                          if other.uid != asset.uid and other.uid not in self.editor_hidden_uids]
+                          if other.uid != asset.uid and other.uid in editor_shown]
         drag["snap_x"], drag["snap_y"] = snap_reference_lines(visible_others, asset.uid)
         drag["spacing_boxes"] = tuple(asset_world_aabb(other) for other in visible_others)
         self._drag = drag
@@ -7492,6 +10121,16 @@ class SceneEditor(tk.Tk):
     def editor_motion(self, event: tk.Event) -> None:
         d = self._drag
         if not d:
+            return
+        if d["mode"] in ("scroll_move", "scroll_resize", "scroll_create"):
+            self._scroll_editor_motion(event, d)
+            return
+        if d["mode"] == "marquee":
+            d["end_screen"] = (event.x, event.y)
+            self.edit_canvas.coords("marquee", *d["start_screen"], event.x, event.y)
+            return
+        if d["mode"] == "group_move":
+            self._move_group(event, d)
             return
         asset: Asset = d["asset"]
         world = self.screen_to_world("edit", event.x, event.y)
@@ -7581,6 +10220,22 @@ class SceneEditor(tk.Tk):
         drag = self._drag
         if drag is None:
             return
+        if drag["mode"] in ("scroll_move", "scroll_resize", "scroll_create"):
+            self._finish_scroll_editor_drag(drag)
+            return
+        if drag["mode"] == "marquee":
+            self._drag = None
+            self._finish_marquee(drag)
+            return
+        if drag["mode"] == "group_move":
+            moved = any((a.px, a.py) != drag["origins"][a.uid] for a in drag["members"])
+            if moved:
+                self._push_undo(drag["before"])
+            self._drag = None
+            self._clear_drag_visual()
+            self._drag_static_cache = None
+            self.request_draw("both")
+            return
         asset = drag["asset"]
         before = (drag["px"], drag["py"], drag["sx"], drag["sy"], drag["rotation"])
         after = (asset.px, asset.py, asset.sx, asset.sy, asset.rotation)
@@ -7598,12 +10253,446 @@ class SceneEditor(tk.Tk):
         delta = {"Left": (-step, 0), "Right": (step, 0),
                  "Up": (0, step), "Down": (0, -step)}[event.keysym]
         self._push_undo()
-        asset.px += delta[0]
-        asset.py += delta[1]
+        for item in self.assets:
+            if item.uid in self.selected_uids:
+                item.px += delta[0]
+                item.py += delta[1]
+        self._drag_static_cache = None
         self._sync_selected_fields(asset)
         self.request_draw("both")
 
+    # ----- Mouse editing for scroll-group viewports (editor only) -----
+
+    def _scroll_group_screen_bounds(self, group: ScrollGroup) -> tuple[float,float,float,float]:
+        x0,y0,x1,y1 = group.bounds
+        left,top = self.world_to_screen("edit", x0, y1)
+        right,bottom = self.world_to_screen("edit", x1, y0)
+        return (left,top,right,bottom)
+
+    def _scroll_group_handles(self, group: ScrollGroup) -> dict[str, tuple[float,float]]:
+        left,top,right,bottom = self._scroll_group_screen_bounds(group)
+        cx,cy = (left+right)/2,(top+bottom)/2
+        return {"nw":(left,top), "n":(cx,top), "ne":(right,top),
+                "e":(right,cy), "se":(right,bottom), "s":(cx,bottom),
+                "sw":(left,bottom), "w":(left,cy)}
+
+    def _draw_scroll_group_overlays(self) -> None:
+        """Draw inexpensive Tk shapes only; no Pillow scene recomposition on resize."""
+        if "edit" not in self.viewports:
+            return
+        canvas=self.edit_canvas
+        canvas.delete("scroll_group_overlay")
+        for group in self.scroll_groups.values():
+            left,top,right,bottom=self._scroll_group_screen_bounds(group)
+            active=group.name==self.selected_scroll_group_name
+            color="#23d4ee" if active else "#40b5c7"
+            canvas.create_rectangle(left,top,right,bottom,outline=color,
+                                    width=3 if active else 2,
+                                    dash=() if active else (6,4),
+                                    tags="scroll_group_overlay")
+            title=f"⇅ {group.name}  X:{'ON' if group.scroll_x else 'OFF'} / Y:{'ON' if group.scroll_y else 'OFF'}"
+            # An opaque label remains legible above sprites and doubles as a drag target.
+            label_id=canvas.create_text(left+6,top+6,anchor="nw",text=title,
+                                         fill="#10202b" if active else "#e2ffff",
+                                         tags="scroll_group_overlay")
+            box=canvas.bbox(label_id)
+            if box:
+                rect=canvas.create_rectangle(box[0]-3,box[1]-2,box[2]+3,box[3]+2,
+                                             fill="#52cfe0" if active else "#2a6b78",
+                                             outline="",tags="scroll_group_overlay")
+                canvas.tag_lower(rect,label_id)
+            if active:
+                for _,(x,y) in self._scroll_group_handles(group).items():
+                    canvas.create_rectangle(x-5,y-5,x+5,y+5,fill="#f9ffff",
+                                            outline="#087b90",width=2,
+                                            tags="scroll_group_overlay")
+        canvas.tag_raise("scroll_group_overlay")
+
+    def _scroll_group_hit(self, sx: float, sy: float,
+                          allow_inside: bool = False) -> Optional[tuple[str,str]]:
+        """Handles precede border/title; Alt+drag may grab any viewport interior."""
+        if "edit" not in self.viewports:
+            return None
+        selected=self.scroll_groups.get(self.selected_scroll_group_name or "")
+        if selected is not None:
+            for handle,(x,y) in self._scroll_group_handles(selected).items():
+                if abs(sx-x)<=9 and abs(sy-y)<=9:
+                    return (selected.name,handle)
+        for group in reversed(tuple(self.scroll_groups.values())):
+            left,top,right,bottom=self._scroll_group_screen_bounds(group)
+            # The label occupies the top-left area just inside the viewport.
+            header = (left+2 <= sx <= min(right,left+250) and
+                      top+2 <= sy <= min(bottom,top+22))
+            within=(left-7<=sx<=right+7 and top-7<=sy<=bottom+7)
+            edge=within and (min(abs(sx-left),abs(sx-right))<=7 or
+                             min(abs(sy-top),abs(sy-bottom))<=7)
+            inside=left<=sx<=right and top<=sy<=bottom
+            if header or edge or (allow_inside and inside):
+                return (group.name,"move")
+        return None
+
+    def enable_scroll_create_mode(self) -> None:
+        self._scroll_create_mode=True
+        self.scroll_create_button.configure(text="範囲作成を終了 (Esc)")
+        self.edit_canvas.configure(cursor="crosshair")
+        self.edit_canvas.focus_set()
+        self.status_text.set("編集画面でドラッグしてスクロール範囲を指定してください。Escでキャンセルできます。")
+
+    def toggle_scroll_create_mode(self) -> None:
+        if self._scroll_create_mode:
+            self._leave_scroll_create_mode()
+        else:
+            self.enable_scroll_create_mode()
+
+    def _leave_scroll_create_mode(self) -> None:
+        self._scroll_create_mode=False
+        self.scroll_create_button.configure(text="ドラッグで範囲作成")
+        self.edit_canvas.configure(cursor="arrow")
+        self.edit_canvas.delete("scroll_new_range")
+
+    def _escape_editor(self, _event: Any = None) -> str:
+        if self._drag is not None and self._drag.get("mode") in (
+                "scroll_move", "scroll_resize", "scroll_create"):
+            d=self._drag
+            if d["mode"] != "scroll_create":
+                group=self.scroll_groups.get(d["group"])
+                if group is not None:
+                    group.px,group.py,group.width,group.height=d["original"]
+            self._drag=None
+            self.edit_canvas.delete("snap_guide")
+            self.edit_canvas.delete("spacing_guide")
+            self._leave_scroll_create_mode()
+            self._draw_scroll_group_overlays()
+            self.request_draw("both")
+        elif self._scroll_create_mode:
+            self._leave_scroll_create_mode()
+        else:
+            self.selected_scroll_group_name=None
+            self.select(None)
+            self._draw_scroll_group_overlays()
+        return "break"
+
+    def _editor_hover(self, event: tk.Event) -> None:
+        if self._drag is not None or self._scroll_create_mode:
+            return
+        if self.selection_mode.get() != "scroll":
+            if self.edit_canvas.cget("cursor") != "arrow":
+                self.edit_canvas.configure(cursor="arrow")
+            return
+        hit=self._scroll_group_hit(event.x,event.y,True)
+        if hit is None:
+            cursor="arrow"
+        elif hit[1] in ("nw","se"):
+            cursor="sizing"
+        elif hit[1] in ("ne","sw"):
+            cursor="sizing"
+        elif hit[1] in ("n","s"):
+            cursor="sb_v_double_arrow"
+        elif hit[1] in ("e","w"):
+            cursor="sb_h_double_arrow"
+        else:
+            cursor="fleur"
+        if self.edit_canvas.cget("cursor")!=cursor:
+            self.edit_canvas.configure(cursor=cursor)
+
+    def _scroll_snap_references(self, exclude_name: Optional[str] = None
+                                ) -> tuple[tuple[float, ...], tuple[float, ...],
+                                           tuple[tuple[float, float, float, float], ...]]:
+        """Snapshot snap targets at drag start; never snap a viewport to itself.
+
+        Shared scene/asset guides and all *other* scroll-group viewport edges and
+        centers participate, respecting the current editor visibility mask.
+        """
+        shown = self._editor_visible_uids()
+        visible = [item for item in self.assets if item.uid in shown]
+        snap_x, snap_y = snap_reference_lines(visible, "")
+        xs, ys = list(snap_x), list(snap_y)
+        boxes = [asset_world_aabb(item) for item in visible]
+        for group in self.scroll_groups.values():
+            if group.name == exclude_name:
+                continue
+            x0, y0, x1, y1 = group.bounds
+            boxes.append((x0, y0, x1, y1))
+            xs.extend((x0, (x0 + x1) / 2, x1))
+            ys.extend((y0, (y0 + y1) / 2, y1))
+        return tuple(sorted(xs)), tuple(sorted(ys)), tuple(boxes)
+
+    def _snap_scroll_point(self, wx: float, wy: float,
+                           drag: dict[str, Any]
+                           ) -> tuple[float, float, Optional[float], Optional[float]]:
+        if not self.snap_enabled.get():
+            return wx, wy, None, None
+        threshold = SNAP_DISTANCE_PX / max(self.viewports["edit"][4], 0.001)
+        dx, gx = nearest_snap((wx,), drag["snap_x"], threshold)
+        dy, gy = nearest_snap((wy,), drag["snap_y"], threshold)
+        return wx + dx, wy + dy, gx, gy
+
+    def _begin_scroll_group_drag(self, event: tk.Event, name: str, handle: str) -> None:
+        group=self.scroll_groups.get(name)
+        if group is None:
+            return
+        self.selected_scroll_group_name=name
+        self.select(None)
+        self._draw_scroll_group_overlays()
+        snap_x, snap_y, spacing_boxes = self._scroll_snap_references(name)
+        self._drag={"mode":"scroll_move" if handle=="move" else "scroll_resize",
+                    "group":name,"handle":handle,
+                    "start_world":self.screen_to_world("edit",event.x,event.y),
+                    "original":(group.px,group.py,group.width,group.height),
+                    "original_bounds":group.bounds,"before":self._snapshot(),
+                    "snap_x":snap_x,"snap_y":snap_y,
+                    "spacing_boxes":spacing_boxes}
+        self.status_text.set(f"スクロール範囲 {name}: {'移動' if handle=='move' else 'サイズ変更'}中（Escで中止）")
+
+    def _clamp_scroll_create_point(self, sx: float, sy: float) -> tuple[float,float]:
+        vx,vy,vw,vh,_=self.viewports["edit"]
+        return (min(max(sx,vx),vx+vw),min(max(sy,vy),vy+vh))
+
+    def _begin_scroll_rectangle(self, event: tk.Event) -> None:
+        snap_x, snap_y, _ = self._scroll_snap_references()
+        drag = {"mode": "scroll_create", "snap_x": snap_x, "snap_y": snap_y}
+        point = self._clamp_scroll_create_point(event.x, event.y)
+        wx, wy = self.screen_to_world("edit", *point)
+        wx, wy, gx, gy = self._snap_scroll_point(wx, wy, drag)
+        point = self._clamp_scroll_create_point(*self.world_to_screen("edit", wx, wy))
+        drag.update({"start_screen": point, "end_screen": point})
+        self._drag = drag
+        self.edit_canvas.delete("scroll_new_range")
+        self.edit_canvas.create_rectangle(*point, *point, fill="", outline="#23d4ee",
+                                          width=2, dash=(5, 3), tags="scroll_new_range")
+        self._paint_snap_guides(gx, gy)
+
+    def _scroll_editor_motion(self, event: tk.Event, d: dict[str,Any]) -> None:
+        guide_x = guide_y = None
+        spacing_guides: list[EqualGapSnap] = []
+        if d["mode"] == "scroll_create":
+            point = self._clamp_scroll_create_point(event.x, event.y)
+            wx, wy = self.screen_to_world("edit", *point)
+            wx, wy, guide_x, guide_y = self._snap_scroll_point(wx, wy, d)
+            point = self._clamp_scroll_create_point(*self.world_to_screen("edit", wx, wy))
+            d["end_screen"] = point
+            self.edit_canvas.coords("scroll_new_range", *d["start_screen"], *point)
+            self._paint_snap_guides(guide_x, guide_y)
+            self.edit_canvas.tag_raise("scroll_new_range")
+            return
+        group = self.scroll_groups.get(d["group"])
+        if group is None:
+            return
+        wx, wy = self.screen_to_world("edit", event.x, event.y)
+        start_x, start_y = d["start_world"]
+        threshold = SNAP_DISTANCE_PX / max(self.viewports["edit"][4], 0.001)
+        if d["mode"] == "scroll_move":
+            old_x, old_y, _, _ = d["original"]
+            dx, dy = wx - start_x, wy - start_y
+            x0, y0, x1, y1 = d["original_bounds"]
+            moving = (x0 + dx, y0 + dy, x1 + dx, y1 + dy)
+            correction_x = correction_y = 0.0
+            if self.snap_enabled.get():
+                correction_x, guide_x = nearest_snap(
+                    (moving[0], (moving[0] + moving[2]) / 2, moving[2]),
+                    d["snap_x"], threshold)
+                correction_y, guide_y = nearest_snap(
+                    (moving[1], (moving[1] + moving[3]) / 2, moving[3]),
+                    d["snap_y"], threshold)
+            if self.spacing_snap_enabled.get():
+                for axis in ("x", "y"):
+                    candidate = equal_gap_snap(moving, d["spacing_boxes"], axis,
+                                               threshold, proximity=threshold * 2)
+                    if candidate is None:
+                        continue
+                    if axis == "x" and (guide_x is None or
+                                        abs(candidate.delta) <= abs(correction_x)):
+                        correction_x, guide_x = candidate.delta, None
+                        spacing_guides.append(candidate)
+                    elif axis == "y" and (guide_y is None or
+                                          abs(candidate.delta) <= abs(correction_y)):
+                        correction_y, guide_y = candidate.delta, None
+                        spacing_guides.append(candidate)
+            group.px = old_x + dx + correction_x
+            group.py = old_y + dy + correction_y
+        else:
+            x0, y0, x1, y1 = d["original_bounds"]
+            handle = d["handle"]
+            # Only the dragged edges snap; the opposite edges stay fixed.
+            dx, dy = wx - start_x, wy - start_y
+            if "w" in handle:
+                x0 = max(x1 - DESIGN_W * 4, min(x0 + dx, x1 - 1))
+            if "e" in handle:
+                x1 = min(x0 + DESIGN_W * 4, max(x1 + dx, x0 + 1))
+            if "n" in handle:
+                y1 = min(y0 + DESIGN_H * 4, max(y1 + dy, y0 + 1))
+            if "s" in handle:
+                y0 = max(y1 - DESIGN_H * 4, min(y0 + dy, y1 - 1))
+            if self.snap_enabled.get():
+                if "w" in handle or "e" in handle:
+                    edge_x = x0 if "w" in handle else x1
+                    adjustment, target = nearest_snap((edge_x,), d["snap_x"], threshold)
+                    proposed = edge_x + adjustment
+                    width = x1 - proposed if "w" in handle else proposed - x0
+                    if 1 <= width <= DESIGN_W * 4:
+                        if "w" in handle:
+                            x0 = proposed
+                        else:
+                            x1 = proposed
+                        guide_x = target
+                if "n" in handle or "s" in handle:
+                    edge_y = y1 if "n" in handle else y0
+                    adjustment, target = nearest_snap((edge_y,), d["snap_y"], threshold)
+                    proposed = edge_y + adjustment
+                    height = proposed - y0 if "n" in handle else y1 - proposed
+                    if 1 <= height <= DESIGN_H * 4:
+                        if "n" in handle:
+                            y1 = proposed
+                        else:
+                            y0 = proposed
+                        guide_y = target
+            group.px = (x0 + x1) / 2
+            group.py = (y0 + y1) / 2
+            group.width = x1 - x0
+            group.height = y1 - y0
+        self._draw_scroll_group_overlays()
+        self._paint_snap_guides(guide_x, guide_y)
+        self._paint_spacing_guides(spacing_guides)
+
+    def _finish_scroll_editor_drag(self, d: dict[str,Any]) -> None:
+        self.edit_canvas.delete("snap_guide")
+        self.edit_canvas.delete("spacing_guide")
+        self._drag=None
+        if d["mode"]=="scroll_create":
+            start=d["start_screen"]
+            end=d["end_screen"]
+            self._leave_scroll_create_mode()
+            if abs(start[0]-end[0])<8 or abs(start[1]-end[1])<8:
+                self.status_text.set("範囲が小さすぎます。ドラッグで幅・高さを指定してください。")
+                return
+            wx0,wy0=self.screen_to_world("edit",*start)
+            wx1,wy1=self.screen_to_world("edit",*end)
+            bounds=(min(wx0,wx1),min(wy0,wy1),max(wx0,wx1),max(wy0,wy1))
+            self._pending_spawn=((bounds[0]+bounds[2])/2,(bounds[1]+bounds[3])/2)
+            self.edit_canvas.after_idle(lambda b=bounds: ScrollGroupDialog(self,initial_bounds=b))
+            return
+        group=self.scroll_groups.get(d["group"])
+        if group is None:
+            return
+        if (group.px,group.py,group.width,group.height)!=d["original"]:
+            self._push_undo(d["before"])
+            self._drag_static_cache=None
+            self.scroll_offsets.pop(group.name,None)
+            self.status_text.set(f"スクロール範囲 '{group.name}' を更新しました。Ctrl+Zで戻せます。")
+            self.request_draw("both")
+        else:
+            self._draw_scroll_group_overlays()
+
+    def _on_selection_mode_change(self) -> None:
+        self._drag = None
+        self.edit_canvas.delete("snap_guide")
+        self.edit_canvas.delete("spacing_guide")
+        if self._scroll_create_mode:
+            self._leave_scroll_create_mode()
+        self.selected_scroll_group_name = None
+        self.select(None)
+        self.edit_canvas.configure(cursor="arrow")
+        self.request_draw("edit")
+        self.status_text.set("スクロール範囲の選択・変形" if self.selection_mode.get() == "scroll"
+                             else "通常アセットの選択・変形")
+
+    def open_scroll_workspace(self, name: Optional[str] = None) -> None:
+        if not self.scroll_groups:
+            messagebox.showinfo(APP_NAME, "まずスクロールグループを作成してください。", parent=self)
+            return
+        if isinstance(name, str) and name in self.scroll_groups:
+            chosen = name
+        elif self.selected_scroll_group_name in self.scroll_groups:
+            chosen = self.selected_scroll_group_name
+        elif len(self.scroll_groups) == 1:
+            chosen = next(iter(self.scroll_groups))
+        else:
+            picker = ScrollWorkspacePicker(self)
+            chosen = picker.result
+        if chosen not in self.scroll_groups:
+            return
+        old = self._scroll_workspace
+        if old is not None and old.winfo_exists():
+            old.destroy()
+        self._scroll_workspace = ScrollWorkspaceDialog(self, chosen)
+
+    def edit_scroll_groups(self, initial_name: Optional[str] = None) -> ScrollGroupDialog:
+        return ScrollGroupDialog(self, initial_name)
+
+    def reset_scroll_offsets(self) -> None:
+        self.scroll_offsets.clear()
+        self._scroll_press = None
+        self.request_draw("preview")
+        self.status_text.set("スクロール位置を初期値に戻しました。")
+
+    def _scroll_group_of(self, uid: str) -> Optional[ScrollGroup]:
+        return next((g for g in self.scroll_groups.values() if uid in g.members), None)
+
+    def _scroll_group_at(self, x: float, y: float) -> Optional[ScrollGroup]:
+        if "preview" not in self.viewports:
+            return None
+        wx,wy=self.screen_to_world("preview",x,y)
+        # Hidden event-gated viewports cannot intercept preview input.
+        active = self._active_scroll_groups(self._preview_visible_uids())
+        # The latest defined group takes precedence for overlapping viewports.
+        for group in reversed(tuple(self.scroll_groups.values())):
+            if group.name not in active:
+                continue
+            a,b,c,d=group.bounds
+            if a <= wx <= c and b <= wy <= d:
+                return group
+        return None
+
+    def _scroll_limits(self, group: ScrollGroup) -> tuple[tuple[float,float],tuple[float,float]]:
+        bounds=[asset_world_aabb(a) for a in self.assets if a.uid in group.members]
+        if not bounds:
+            return ((0.0,0.0),(0.0,0.0))
+        cx0=min(b[0] for b in bounds)
+        cy0=min(b[1] for b in bounds)
+        cx1=max(b[2] for b in bounds)
+        cy1=max(b[3] for b in bounds)
+        x0,y0,x1,y1=group.bounds
+        xlim=(min(0.0,x1-cx1),max(0.0,x0-cx0)) if group.scroll_x else (0.0,0.0)
+        ylim=(min(0.0,y1-cy1),max(0.0,y0-cy0)) if group.scroll_y else (0.0,0.0)
+        return xlim,ylim
+
+    def _scroll_by(self, group: ScrollGroup, dx: float, dy: float) -> bool:
+        ox,oy=self.scroll_offsets.get(group.name,(0.0,0.0))
+        xlim,ylim=self._scroll_limits(group)
+        nx=max(xlim[0],min(xlim[1],ox+dx))
+        ny=max(ylim[0],min(ylim[1],oy+dy))
+        if abs(nx-ox)<1e-6 and abs(ny-oy)<1e-6:
+            return False
+        self.scroll_offsets[group.name]=(nx,ny)
+        self.request_draw("preview")
+        return True
+
+    def preview_wheel(self, event: tk.Event) -> str:
+        group=self._scroll_group_at(event.x,event.y)
+        if group is None:
+            return "break"
+        if getattr(event,"num",0)==4:
+            clicks=1
+        elif getattr(event,"num",0)==5:
+            clicks=-1
+        else:
+            clicks=max(-3.0,min(3.0,float(getattr(event,"delta",0))/120.0))
+        if not clicks:
+            return "break"
+        horizontal = bool(event.state & 0x1) or (group.scroll_x and not group.scroll_y)
+        if horizontal and group.scroll_x:
+            self._scroll_by(group,clicks*56,0)
+        elif group.scroll_y:
+            self._scroll_by(group,0,clicks*56)
+        return "break"
+
     def preview_click(self, event: tk.Event) -> None:
+        if not self._scroll_dispatch_click:
+            group=self._scroll_group_at(event.x,event.y)
+            if group is not None:
+                self._scroll_press={"group":group.name,"x":event.x,"y":event.y,
+                                    "last_x":event.x,"last_y":event.y,"moved":False}
+                return
         asset = self._hit_asset("preview", event.x, event.y)
         if asset is not None and asset.kind == "toggle_uv":
             self.pressed_button_uid = asset.uid
@@ -7644,6 +10733,20 @@ class SceneEditor(tk.Tk):
             self.request_draw("preview")
 
     def preview_drag_held(self, event: tk.Event) -> None:
+        if self._scroll_press is not None:
+            drag=self._scroll_press
+            group=self.scroll_groups.get(drag["group"])
+            if group is None:
+                self._scroll_press=None
+                return
+            if math.hypot(event.x-drag["x"],event.y-drag["y"])>5:
+                drag["moved"]=True
+            if drag["moved"]:
+                scale=self.viewports["preview"][4]
+                self._scroll_by(group, (event.x-drag["last_x"])/scale if group.scroll_x else 0.0,
+                                -(event.y-drag["last_y"])/scale if group.scroll_y else 0.0)
+                drag["last_x"],drag["last_y"]=event.x,event.y
+            return
         if self.pressed_button_uid is None:
             return
         target = self._hit_asset("preview", event.x, event.y)
@@ -7653,6 +10756,17 @@ class SceneEditor(tk.Tk):
             self.request_draw("preview")
 
     def preview_release(self, event: tk.Event) -> None:
+        if self._scroll_press is not None:
+            drag=self._scroll_press
+            self._scroll_press=None
+            if not drag["moved"]:
+                self._scroll_dispatch_click=True
+                try:
+                    self.preview_click(event)
+                    self.preview_release(event)
+                finally:
+                    self._scroll_dispatch_click=False
+            return
         uid = self.pressed_button_uid
         if uid is None:
             return
@@ -7661,9 +10775,16 @@ class SceneEditor(tk.Tk):
             hit = self._hit_asset("preview", event.x, event.y)
             if hit is not None and hit.uid == uid:
                 current = self.toggle_states.get(uid, asset.toggle_default)
-                new_state = "on" if current == "off" else "off"
-                self.toggle_states[uid] = new_state
-                self.status_text.set(f"トグルボタン {asset.name}: {new_state}")
+                if asset.toggle_group:
+                    new_state = "on"
+                    for member in self.assets:
+                        if member.toggle_group == asset.toggle_group:
+                            self.toggle_states[member.uid] = ("on" if member.uid == uid else "off")
+                    self.status_text.set(f"排他スイッチ {asset.toggle_group}: {asset.name} をONにしました。")
+                else:
+                    new_state = "on" if current == "off" else "off"
+                    self.toggle_states[uid] = new_state
+                    self.status_text.set(f"トグルボタン {asset.name}: {new_state}")
                 if asset.button_se:
                     se_info = self.audio["se"].get(asset.button_se)
                     if se_info:
@@ -7671,9 +10792,13 @@ class SceneEditor(tk.Tk):
                     else:
                         messagebox.showwarning(APP_NAME,
                             f"トグルボタン {asset.name} のSE '{asset.button_se}' が未登録です。", parent=self)
+        if asset is not None and asset.kind in ("button", "button_uv"):
+            hit = self._hit_asset("preview", event.x, event.y)
+            if hit is not None and hit.uid == uid:
+                self._run_button_scroll_events(asset)
         self.pressed_button_uid = None
         self._button_pointer_inside = False
-        self.request_draw("preview")
+        self._preview_visibility_changed()
 
     def _tick(self) -> None:
         self._tick_job = None
@@ -7703,15 +10828,21 @@ class SceneEditor(tk.Tk):
         self.pressed_button_uid = None
 
     def delete_selected(self) -> None:
-        asset = self.get_selected()
-        if asset is None:
+        targets = {uid for uid in self.selected_uids if self._asset_by_uid(uid) is not None}
+        if not targets:
             return
+        count = len(targets)
         self._push_undo()
-        self._remove_asset_tree(asset.uid)
+        for uid in targets:
+            if self._asset_by_uid(uid) is not None:
+                self._remove_asset_tree(uid)
+        self._repair_toggle_groups()
+        self._drag_static_cache = None
         self._refresh_event_windows()
         self.select(None)
         self.refresh_tree()
         self.request_draw("both")
+        self.status_text.set(f"{count} 個のアセットを削除しました（Ctrl+Zでまとめて取り消し可能）。")
 
     def _editing_text_field(self) -> bool:
         """Allow Ctrl+C/Ctrl+V to retain their native semantics in text controls."""
@@ -7728,7 +10859,10 @@ class SceneEditor(tk.Tk):
             self.status_text.set("コピーするアセットを選択してください。")
             return "break"
         self._asset_clipboard = self._asset_state_copy(asset)
+        group=self._scroll_group_of(asset.uid)
+        self._asset_clipboard_scroll_group=group.name if group else None
         self._asset_clipboard.event_owner_uid = None
+        self._asset_clipboard.toggle_group = None
         self._clipboard_descendants = {a.uid: self._asset_state_copy(a) for a in self.assets}
         self._asset_clipboard.raster_cache = {}
         self._paste_count = 0
@@ -7757,6 +10891,7 @@ class SceneEditor(tk.Tk):
             clone = self._asset_state_copy(original)
             clone.uid = uuid.uuid4().hex
             clone.event_owner_uid = None
+            clone.toggle_group = None
             clone.raster_cache = {}
             used = {asset.name for asset in self.assets if asset.category == clone.category}
             serial = 2
@@ -7769,6 +10904,8 @@ class SceneEditor(tk.Tk):
             clone.py = original.py - 32.0 * next_paste
             self._push_undo()
             self.assets.append(clone)
+            if self._asset_clipboard_scroll_group in self.scroll_groups:
+                self.scroll_groups[self._asset_clipboard_scroll_group].members.add(clone.uid)
             if clone.kind == "toggle_uv":
                 self.toggle_states[clone.uid] = clone.toggle_default
                 self._clone_event_descendants(original, clone, self._clipboard_descendants,
@@ -7790,6 +10927,7 @@ class SceneEditor(tk.Tk):
         duplicated = self._asset_state_copy(asset)
         duplicated.uid = uuid.uuid4().hex
         duplicated.event_owner_uid = asset.event_owner_uid
+        duplicated.toggle_group = None
         duplicated.raster_cache = {}
         duplicated.px += 32
         duplicated.py -= 32
@@ -7804,6 +10942,10 @@ class SceneEditor(tk.Tk):
             if owner is not None:
                 owner.events.append({"type": "show", "asset_uid": duplicated.uid})
         self.assets.append(duplicated)
+        if duplicated.event_owner_uid is None:
+            group=self._scroll_group_of(asset.uid)
+            if group is not None:
+                group.members.add(duplicated.uid)
         if duplicated.kind == "toggle_uv":
             self.toggle_states[duplicated.uid] = duplicated.toggle_default
             self._clone_event_descendants(asset, duplicated,
@@ -8131,6 +11273,8 @@ class SceneEditor(tk.Tk):
                     raise ValueError(f"{asset.name}: 初期状態が不正です。")
                 entry = {**transform, "default": asset.toggle_default,
                          "state": {"off": idle, "on": pressed}}
+                if asset.toggle_group:
+                    entry["group"] = asset.toggle_group
                 events: list[dict[str, Any]] = []
                 for event in asset.events:
                     if event["type"] == "hide":
@@ -8138,6 +11282,14 @@ class SceneEditor(tk.Tk):
                         if target is None or target.event_owner_uid is not None:
                             raise ValueError(f"{asset.name}: 非表示対象が存在しません。")
                         events.append({"type": "hide", "target": target.full_key})
+                    elif event["type"] == "show_scroll_group":
+                        name = event["group_name"]
+                        group = self.scroll_groups.get(name)
+                        if group is None:
+                            raise ValueError(f"{asset.name}: 表示対象グループ '{name}' が存在しません。")
+                        if asset.uid in group.members:
+                            raise ValueError(f"{asset.name}: 自身の所属グループは表示制御できません。")
+                        events.append({"type": "show_scroll_group", "group": name})
                     elif event["type"] == "show":
                         child = lookup.get(event["asset_uid"])
                         if child is None or child.event_owner_uid != asset.uid:
@@ -8157,6 +11309,20 @@ class SceneEditor(tk.Tk):
                     entry["events"] = events
             else:
                 entry = {**transform, "state": {"idle": idle, "on push": pressed}}
+                if asset.events:
+                    command_events = []
+                    for event in asset.events:
+                        kind = event["type"]
+                        if kind not in ("show_scroll_group", "hide_scroll_group", "toggle_scroll_group"):
+                            raise ValueError(f"{asset.name}: 通常ボタンのイベント種別が不正です。")
+                        name = event["group_name"]
+                        group = self.scroll_groups.get(name)
+                        if group is None:
+                            raise ValueError(f"{asset.name}: 表示対象グループ '{name}' がありません。")
+                        if asset.uid in group.members and kind != "hide_scroll_group":
+                            raise ValueError(f"{asset.name}: 自身の所属グループは表示・切替できません。")
+                        command_events.append({"type": kind, "group": name})
+                    entry["events"] = command_events
             if asset.button_se:
                 if asset.button_se not in self.audio["se"]:
                     raise ValueError(f"{asset.name}: SE '{asset.button_se}' が未登録です。")
@@ -8206,6 +11372,8 @@ class SceneEditor(tk.Tk):
                 if flags[1]: prefetch.append(f"{category}.{key}")
         lookup = {a.uid: a for a in self.assets}
         main_assets = [a for a in self.assets if a.event_owner_uid is None]
+        validate_toggle_groups(self.assets)
+        validate_scroll_toggle_events(self.assets, self.scroll_groups)
         for asset in main_assets:
             entry = self._serialize_asset_entry(asset, lookup)
             if asset.kind == "animation":
@@ -8217,7 +11385,26 @@ class SceneEditor(tk.Tk):
                 ui[group][asset.name] = entry
             if asset.critical: critical.append(asset.full_key)
             if asset.prefetch: prefetch.append(asset.full_key)
+        scroll_json: dict[str, Any]={}
+        used_members: set[str]=set()
+        for key,group in self.scroll_groups.items():
+            safe_asset_key(key)
+            if not 1 <= group.width <= DESIGN_W*4 or not 1 <= group.height <= DESIGN_H*4:
+                raise ValueError(f"{key}: スクロール表示範囲が不正です。")
+            member_refs=[]
+            for item in self.assets:
+                if item.uid not in group.members:
+                    continue
+                if item.uid in used_members:
+                    raise ValueError(f"{item.name}: 複数スクロールグループには所属できません。")
+                used_members.add(item.uid)
+                member_refs.append(item.full_key)
+            scroll_json[key]={"px":json_number(group.px),"py":json_number(group.py),
+                              "width":json_number(group.width),"height":json_number(group.height),
+                              "scroll_x":bool(group.scroll_x),"scroll_y":bool(group.scroll_y),
+                              "members":member_refs}
         return {"version": 1, "scene": scene,
+                **({"scroll_groups":scroll_json} if scroll_json else {}),
                 "assets": {**audio_output, "background": background,
                            "ui": ui, "animation": animations},
                 "asset_order": [asset.full_key for asset in main_assets],
@@ -8289,18 +11476,25 @@ class SceneEditor(tk.Tk):
             return False
 
     def new_scene(self) -> None:
-        if (self.assets or self.background_file or any(self.audio.values())) and not messagebox.askyesno(
+        if (self.assets or self.scroll_groups or self.background_file or any(self.audio.values())) and not messagebox.askyesno(
                 APP_NAME, "現在のシーンを破棄して新規作成しますか？", parent=self):
             return
         self.stop_animations()
         self.audio_player.stop()
         self._undo_stack.clear()
         self._close_event_windows()
+        if self._scroll_workspace is not None and self._scroll_workspace.winfo_exists():
+            self._scroll_workspace.close()
         self._drag_static_cache = None
         self._background_cache.clear()
         self.assets.clear()
+        self.scroll_groups.clear()
+        self.selected_scroll_group_name = None
+        self.scroll_offsets.clear()
+        self._scroll_press=None
         self.editor_hidden_uids.clear()
         self.toggle_states.clear()
+        self.button_scroll_states.clear()
         self.audio = {"bgm": {}, "se": {}}
         self.audio_flags.clear()
         self.background_file = None
@@ -8377,7 +11571,10 @@ class SceneEditor(tk.Tk):
                         ordered[child.event_layer] = child
                     roots = iter(main_assets)
                     new_assets = [a if a is not None else next(roots) for a in ordered]
-            new_audio: dict[str, dict[str, dict[str, str]]] = {"bgm": {}, "se": {}}
+            loaded_scroll_groups = read_scroll_groups(root.get("scroll_groups"), new_assets,
+                                                       strict_numeric=strict_numeric)
+            validate_scroll_toggle_events(new_assets, loaded_scroll_groups)
+            new_audio: dict[str, dict[str, dict[str, str]]] = {"bgm": {}, "se": {}} 
             new_flags = {}
             for category in ("bgm", "se"):
                 entries = resources.get(category, {})
@@ -8416,9 +11613,17 @@ class SceneEditor(tk.Tk):
             self.audio_player.stop()
             self._undo_stack.clear()
             self._close_event_windows()
+            if self._scroll_workspace is not None and self._scroll_workspace.winfo_exists():
+                self._scroll_workspace.close()
             self._drag_static_cache = None
             self._background_cache.clear()
             self.assets = new_assets
+            self.scroll_groups = loaded_scroll_groups
+            self.selected_scroll_group_name = None
+            self._scroll_create_mode = False
+            self.scroll_create_button.configure(text="ドラッグで範囲作成")
+            self.scroll_offsets.clear()
+            self._scroll_press=None
             self.editor_hidden_uids.clear()
             self._reset_toggle_states()
             self.audio, self.audio_flags = new_audio, new_flags
@@ -8444,6 +11649,8 @@ class SceneEditor(tk.Tk):
 
     def quit_app(self) -> None:
         self._close_event_windows()
+        if self._scroll_workspace is not None and self._scroll_workspace.winfo_exists():
+            self._scroll_workspace.close()
         self.stop_animations()
         self._clear_drag_visual()
         self._drag_static_cache = None
